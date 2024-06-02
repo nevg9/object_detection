@@ -1,2 +1,2 @@
 # object_detection
-物体识别项目
+目标检测项目
