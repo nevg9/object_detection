@@ -17,6 +17,10 @@ from utils.dataloaders import IMG_FORMATS, VID_FORMATS, LoadImages, LoadScreensh
 from utils.general import (LOGGER, Profile, check_file, check_img_size, check_imshow, check_requirements, colorstr, cv2,
                            increment_path, non_max_suppression, print_args, scale_boxes, strip_optimizer, xyxy2xywh)
 from utils.torch_utils import select_device, smart_inference_mode
+import time
+import logging
+from logging.handlers import TimedRotatingFileHandler
+
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -26,6 +30,20 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 
 app = Flask(__name__)
+# 配置日志记录
+log_directory = 'logs'
+os.makedirs(log_directory, exist_ok=True)  # 创建日志目录（如果不存在）
+log_handler = TimedRotatingFileHandler(
+    os.path.join(log_directory, 'app.log'),  # 日志文件名
+    when='D',  # 'D'表示每天滚动日志文件
+    interval=1,  # 滚动周期（天）
+    backupCount=7  # 保留的旧日志文件数量
+)
+log_handler.setLevel(logging.INFO)
+log_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+app.logger.addHandler(log_handler)  # 添加日志处理程序
+app.logger.setLevel(logging.INFO)
+app.logger.info('Flask application started')  # 启动时记录一条日志
 
 
 def load_detect_mode(device: str, weights: str, data: str, imgsz=(640, 640)):
@@ -102,22 +120,28 @@ def binary_to_jpg(binary_data, output_filename='output.jpg'):
 
 @app.route('/predict_classifier', methods=['POST'])
 def predict_classifier():
+    start_time = time.time()  # 开始时间
     # 获取二进制图片数据
     binary_data = request.data
-    binary_to_jpg(binary_data)
+    # binary_to_jpg(binary_data)
     # 获取已加载的模型
     model = app.config['classifier_model']
     processed_image = process_image_classifier_image(binary_data)
+    process_image_end_time = time.time()
+    image_time = (process_image_end_time - start_time) * 1000
     # 使用模型进行预测
     predict_value = model(processed_image)
 
     max_prob, predicted_class = torch.max(
         F.softmax(predict_value, dim=1), dim=1)
+    end_time = time.time()  # 开始时间
+    processing_time = (end_time - start_time) * 1000  # 计算耗时（单位：毫秒）
+    app.logger.info(f"classifier processing time: {processing_time} ms, process image time: {image_time} ms")
     return jsonify({'prediction': max_prob.item(), 'label': predicted_class.item()})
 
 
 def transform_images(im0, img_size, stride, auto):
-    assert im0 is not None, f'Image is None'
+    assert im0 is not None, 'Image is None'
     im = letterbox(im0, img_size, stride=stride, auto=auto)[0]  # padded resize
     im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
     im = np.ascontiguousarray(im)  # contiguous
@@ -177,8 +201,16 @@ def process_image_to_detect(binary_data):
 
 @app.route('/predict_detect', methods=['POST'])
 def predict_detect():
+    start_time = time.time()  # 开始时间
     # 获取二进制图片数据
     binary_data = request.data
     # 获取已加载的模型
     results_dict = process_image_to_detect(binary_data)
+    end_time = time.time()  # 结束时间
+    processing_time = (end_time - start_time) * 1000  # 计算耗时（单位：毫秒）
+    app.logger.info(f"detect processing time: {processing_time} ms")
     return jsonify(results_dict)
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
