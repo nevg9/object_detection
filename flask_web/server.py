@@ -123,6 +123,8 @@ def predict_classifier():
     start_time = time.time()  # 开始时间
     # 获取二进制图片数据
     binary_data = request.data
+    resource_id = request.headers.get('resourceId')
+    media_type = request.headers.get('mediaType')
     # binary_to_jpg(binary_data)
     # 获取已加载的模型
     model = app.config['classifier_model']
@@ -137,7 +139,16 @@ def predict_classifier():
     end_time = time.time()  # 开始时间
     processing_time = (end_time - start_time) * 1000  # 计算耗时（单位：毫秒）
     app.logger.info(f"classifier processing time: {processing_time} ms, process image time: {image_time} ms")
-    return jsonify({'prediction': max_prob.item(), 'label': predicted_class.item()})
+    # 构建返回数据
+    response_data = {
+        'prediction': max_prob.item(),
+        'label': predicted_class.item()
+    }
+    if resource_id:
+        response_data['resourceId'] = resource_id
+    if media_type:
+        response_data['mediaType'] = media_type
+    return jsonify(response_data)
 
 
 def transform_images(im0, img_size, stride, auto):
@@ -204,11 +215,17 @@ def predict_detect():
     start_time = time.time()  # 开始时间
     # 获取二进制图片数据
     binary_data = request.data
+    resource_id = request.headers.get('resourceId')
+    media_type = request.headers.get('mediaType')
     # 获取已加载的模型
     results_dict = process_image_to_detect(binary_data)
     end_time = time.time()  # 结束时间
     processing_time = (end_time - start_time) * 1000  # 计算耗时（单位：毫秒）
     app.logger.info(f"detect processing time: {processing_time} ms")
+    if resource_id:
+        results_dict['resourceId'] = resource_id
+    if media_type:
+        results_dict['mediaType'] = media_type
     return jsonify(results_dict)
 
 
