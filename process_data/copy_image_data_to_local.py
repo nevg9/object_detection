@@ -53,8 +53,10 @@ def copy_image_to_local(content, root_dir):
 
 
 def write_json_file(file_name, data):
-    with open(file_name, "w") as json_file:
-        json.dump(data, json_file, ensure_ascii=False)
+    with open(file_name, "w", encoding="utf-8") as json_file:
+        for item in data:
+            json.dump(item, json_file, ensure_ascii=False)
+            json_file.write('\n')
 
 
 def json_contents_to_path(actions, local_files, root_dir, dir_name, fs_dir):
@@ -137,5 +139,8 @@ if __name__ == '__main__':
         len(human_action), len(animal_action), len(no_action)))
 
     get_image_classifier_data(human_action, animal_action, no_action, args.fs)
+    write_json_file(human_action, "human_action.json")
+    write_json_file(animal_action, "animal_action.json")
+    write_json_file(no_action, "no_action.json")
 
     copy_file_failed_fd.close()

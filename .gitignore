@@ -37,3 +37,4 @@ ENV/
 *.txt
 *.json
 *.csv
+*.log.*
