@@ -43,6 +43,11 @@ def copy_image_to_local(content, root_dir):
     try:
         Image.open(content["有效路径"])
         content["本地路径"] = root_dir + "/" + content["有效路径"].split("/")[-1]
+        path_list = content["本地路径"].split(".")
+        if len(path_list) == 1:
+            content["本地路径"] += ".jpg"
+        else:
+            content["本地路径"] = ".".join(path_list[:-1]) + ".jpg"
         shutil.copyfile(content["有效路径"], content["本地路径"])
         return True
     except Exception:

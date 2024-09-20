@@ -1,9 +1,9 @@
 import random
-from PIL import Image
 import os
 import shutil
 import argparse
 import csv
+import json
 from process_image_data_tools import json_contents_to_path, read_images_json_file
 
 
@@ -194,7 +194,7 @@ def species_statistic_info_to_csv(species_map_to_count, all_species_num_map, ima
     return species_name_to_class
 
 
-def test_image_json_have_dumplicate_image_id(image_json):
+def test_image_json_have_dumplicate_image_id(image_json, root_dir, dir_name):
     image_id_num = {}
     for item in image_json:
         id = item["图片id"]
@@ -203,100 +203,14 @@ def test_image_json_have_dumplicate_image_id(image_json):
         else:
             image_id_num[id] = 1
     ge_2_num = 0
-    for id, num in image_id_num.items():
-        if num > 1:
-            # print(id, num)
-            ge_2_num += 1
+    dir_path = os.path.join(root_dir, dir_name)
+    with open(f"{dir_path}/image_id_have_least_two_times.txt", 'w') as f:
+        for id, num in image_id_num.items():
+            if num > 1:
+                # print(id, num)
+                ge_2_num += 1
+                f.write(f"{id}:{num}\n")
     print(f"ge_2_num:{ge_2_num}")
-
-
-def transform_position(w, h, position_str, positions_list):
-    """从原始数据的标注的框位置转化为真实图片标注框的位置，图片位置记录方式为 左上x坐标，左上y坐标，右下x坐标，右下y坐标"""
-    position_str = position_str.strip("()")
-    position_str_split = position_str.split("),(")
-    for string in position_str_split:
-        number_strings = string.split(",")
-        try:
-            numbers = [int(num) for num in number_strings]
-        except Exception:
-            return False
-        if len(numbers) != 4:
-            return False
-        to_zero_possition = [i if i > 0 else 0 for i in numbers]
-        new_possions = [y / 65536 * w if x % 2 == 0 else y /
-                        65536 * h for x, y in enumerate(to_zero_possition)]
-        if abs(new_possions[0] - new_possions[2]) < 2 or abs(new_possions[1] - new_possions[3]) < 2:
-            continue
-
-        positions_list.append(new_possions)
-    if len(positions_list) == 0:
-        return False
-    return True
-
-
-def parse_raw_data_get_positions(animal_action):
-    new_image_datas = {}
-    error_possition = set()
-    error_image = set()
-    total_image = set()
-    for image_data in open(animal_action):
-        total_image.add(image_data["图片id"])
-        try:
-            image = Image.open(image_data["本地路径"])
-        except Exception:
-            print(f"error:{image_data}")
-            error_possition.add(image_data["图片id"])
-            continue
-        w, h = image.size
-        # dict_data["图片id"] = image_data["图片id"]
-        # dict_data["本地路径"] = image_data["本地路径"]
-        object_data = {}
-        object_data["物种名称"] = image_data["物种名称"]
-        object_data["性别"] = image_data["性别"]
-        object_data["年龄"] = image_data["年龄"]
-        object_data["物种id"] = image_data["物种id"]
-        positions_list = []
-        if not transform_position(w, h, image_data["位置坐标"], positions_list):
-            # print("error possition:", line)
-            error_possition.add(image_data["图片id"])
-            continue
-        object_data["位置坐标"] = positions_list
-
-        if image_data["图片id"] not in new_image_datas:
-            new_dict = {}
-            new_dict["图片id"] = image_data["图片id"]
-            new_dict["图片高度"] = h
-            new_dict["图片宽度"] = w
-            new_dict["本地路径"] = image_data["本地路径"]
-            new_dict["保护地id"] = image_data["保护地id"]
-            new_dict["保护地名称"] = image_data["保护地名称"]
-            new_dict["objects"] = [object_data]
-            new_image_datas[image_data["图片id"]] = new_dict
-        else:
-            data_content = new_image_datas[image_data["图片id"]]
-            data_content["objects"].append(object_data)
-
-    print("图片总数：{}, 图片打开失败的数量为：{}, 图片中位置信息有问题的数量为：{}, 没问题的图片数量: {}.".format(
-        len(total_image), len(error_image), len(error_possition), len(new_image_datas)))
-    return new_image_datas
-
-
-def transform_to_yolo_positions(positions_lists, w, h):
-    """将图片框的 左上x坐标，左上y坐标，右下x坐标，右下y坐标格式，转换为yolo框标定的格式：x_center, y_center, width, height(归一化)"""
-    new_positions = []
-    for positions_list in positions_lists:
-        x_center = (positions_list[2] + positions_list[0]) / 2
-        y_center = (positions_list[3] + positions_list[1]) / 2
-        width = positions_list[2] - positions_list[0]
-        height = positions_list[3] - positions_list[1]
-
-        # normalize
-        x_center = x_center / w
-        y_center = y_center / h
-        width = width / w
-        height = height / h
-        new_positions.append([x_center, y_center, width, height])
-    return new_positions
 
 
 def get_animal_image_train_test_data_to_local_dir(image_json_actions, image_json_name, fs_dir, root_dir, least_num_not_to_test_image_id_set,
@@ -340,10 +254,40 @@ def get_no_test_image_ids_set(animal_action, least_num_not_to_test_key_set, spec
     return least_num_not_to_test_image_id_set
 
 
+# 过滤掉没有位置坐标的数据
+def filter_no_position_str(animal_action):
+    animal_action_new = []
+    filter_no_position_num = 0
+    for x in animal_action:
+        if "位置坐标" not in x:
+            filter_no_position_num += 1
+            continue
+        if len(x["位置坐标"]) < 4:
+            filter_no_position_num += 1
+            continue
+        animal_action_new.append(x)
+    print(f"filter_no_position_num:{filter_no_position_num}")
+    return animal_action_new
+
+
 def main(file_name, root_dir, dir_name, fs_dir, class_least_num, max_workers=3):
     # 查看照片中所有的年龄和性别的标注情况
     # 查看数据所有的年龄和性别标注情况
+    image_download_dir = os.path.join(root_dir, dir_name)
+    print(f"image download dir: {image_download_dir}")
+    # 检查目录是否存在
+    if os.path.exists(image_download_dir):
+        # 如果存在，删除目录
+        shutil.rmtree(image_download_dir)
+        print(f"目录 {image_download_dir} 已删除")
+    # 创建目录
+    os.makedirs(image_download_dir)
+    print(f"目录 {image_download_dir} 已创建")
     animal_action = read_images_json_file(file_name)
+    with open(f"{root_dir}/{dir_name}/animal_action_single.json", 'w') as f:
+        for x in animal_action:
+            f.write(json.dumps(x, ensure_ascii=False) + "\n")
+    animal_action = filter_no_position_str(animal_action)
     age_set, gender_set = get_all_age_gender_set(animal_action)
     print("年龄标注情况:", age_set)
     print("性别标注情况:", gender_set)
@@ -355,16 +299,6 @@ def main(file_name, root_dir, dir_name, fs_dir, class_least_num, max_workers=3):
     not_found_animal = set()
     species_to_another_species = {}
     species_map_to_count = {}
-    image_download_dir = os.path.join(root_dir, dir_name)
-    print(f"image download dir: {image_download_dir}")
-    # 检查目录是否存在
-    if os.path.exists(image_download_dir):
-        # 如果存在，删除目录
-        shutil.rmtree(image_download_dir)
-        print(f"目录 {image_download_dir} 已删除")
-    # 创建目录
-    os.makedirs(image_download_dir)
-    print(f"目录 {image_download_dir} 已创建")
     # 根据专家填写的分类码表，检查数据集的分类并把一些分类转换成另一个分类
     check_label_data("./物种分类码表-野生动物.csv",
                      species_to_another_species, species_map_to_count)
@@ -385,7 +319,7 @@ def main(file_name, root_dir, dir_name, fs_dir, class_least_num, max_workers=3):
     # 得到不能分到test的图片id
     least_num_not_to_test_image_id_set = get_no_test_image_ids_set(animal_action, least_num_not_to_test_key_set, species_to_another_species, gender_map, age_map)
     print(f"least_num_not_to_test_image_id_set num: {len(least_num_not_to_test_image_id_set)}")
-    test_image_json_have_dumplicate_image_id(animal_action)
+    test_image_json_have_dumplicate_image_id(animal_action, root_dir, dir_name)
     # 拉取 animal 数据
     get_animal_image_train_test_data_to_local_dir(animal_action, dir_name, fs_dir, root_dir, least_num_not_to_test_image_id_set, 0.1, max_workers)
 
