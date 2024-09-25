@@ -3,6 +3,7 @@ from PIL import Image
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
+from tqdm import tqdm
 
 
 # 该函数的输入是process_data/get_animal_image_transform_train_test_data.py调整后的json文件
@@ -10,7 +11,7 @@ def read_image_data_json(json_file_path):
     # image_id -> local_path, {物种名称 : yolo坐标}
     image_id_local_path_and_position_list_map = {}
     invalid_position_num = 0
-    for line_number, line in enumerate(open(json_file_path), 1):
+    for line_number, line in tqdm(enumerate(open(json_file_path), 1), desc="read json file", total=sum(1 for _ in open(json_file_path)), unit="行"):
         line = line.strip()
         try:
             data = json.loads(line)
@@ -19,9 +20,7 @@ def read_image_data_json(json_file_path):
             print(line_number, line)
             continue
         image_id = data['图片id']
-        # local_path = data['本地路径']
-        # 临时加的代码
-        local_path = data['本地路径'].replace("animal_action", "animal_action.bak")
+        local_path = data['本地路径']
         species_name = data['species_name']
         # 无位置坐标
         if len(data['位置坐标']) < 3:
@@ -42,16 +41,6 @@ def read_image_data_json(json_file_path):
                 image_id_local_path_and_position_list_map[image_id][1][species_name].append(data["位置坐标"])
             else:
                 image_id_local_path_and_position_list_map[image_id][1][species_name] = [data["位置坐标"]]
-    # 是否输出下一个image中是否有不同的动物
-    # for image_id, value in image_id_local_path_and_position_list_map.items():
-    #     species_info = value[1]
-    #     species_name = set()
-    #     for species in species_info.keys():
-    #         species_name.add(species.split(',')[0])
-    #     if len(species_name) > 1:
-    #         print("image_id:", image_id)
-    #         print("species_name:", species_name)
-    #         print("local_path:", value[0])
     print(f"invalid_position_num: {invalid_position_num}")
     return image_id_local_path_and_position_list_map
 
@@ -203,8 +192,7 @@ def get_image_class_and_yolo_position(image_item, name_to_class_map):
 
 
 def process_image_data(image_id_local_path_and_position_list_map, name_to_class_map):
-
-    for image_id, value in image_id_local_path_and_position_list_map.items():
+    for image_id, value in tqdm(image_id_local_path_and_position_list_map.items(), total=len(image_id_local_path_and_position_list_map), desc="read image data", unit="个"):
         if len(value) == 0:
             continue
         if not get_image_class_and_yolo_position(value, name_to_class_map):
@@ -213,7 +201,7 @@ def process_image_data(image_id_local_path_and_position_list_map, name_to_class_
 
 
 def save_yolo_lable_txt(image_id_local_path_and_position_list_map):
-    for _, v in image_id_local_path_and_position_list_map.items():
+    for _, v in tqdm(image_id_local_path_and_position_list_map.items(), desc="save yolo label", total=len(image_id_local_path_and_position_list_map), unit="个"):
         local_path = v[0]
         class_id_to_positions_map = v[2]
         split_list = local_path.split("/")
@@ -248,10 +236,10 @@ if __name__ == "__main__":
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('-r', '--root_dir', type=str,
-                        default="/mnt/data2/all_species_240916/animal_action.bak", help='动物照片下载的目录')
+                        default="/mnt/data2/all_species_240916/animal_action", help='动物照片下载的目录')
     parser.add_argument('-c', '--class_info_file', type=str,
-                        default="/mnt/data2/all_species_240916/animal_action.bak/species_name_to_class_gt_10.txt", help='物种类别信息转id的码表')
+                        default="/mnt/data2/all_species_240916/animal_action/species_name_to_class_gt_10.txt", help='物种类别信息转id的码表')
     parser.add_argument('-j', '--json_file', type=str,
-                        default="/mnt/data2/all_species_240916/animal_action.bak/success.json", help='动物照片下载成功的照片信息')
+                        default="/mnt/data2/all_species_240916/animal_action/success.json", help='动物照片下载成功的照片信息')
     args = parser.parse_args()
     main(args.root_dir, args.class_info_file, args.json_file)
