@@ -3,6 +3,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import os
 import shutil
+"""
+该代码构造数据前需要先运行构造目标检测构造数据的流程，然后从对应的目标检测数据的目录里去获取对应的数据
+process_data/get_animal_image_transform_train_test_data.py，process_data/get_human_image_data.py，process_data/get_no_target_image_data.py
+"""
 
 
 # 定义拷贝函数

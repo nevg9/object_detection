@@ -6,6 +6,8 @@
 
 数据构造[参考链接](https://docs.ultralytics.com/datasets/classify/#what-datasets-are-supported-by-ultralytics-yolo-for-image-classification)
 
+参考数据构造代码：image_classifier/get_classifier_data.py
+
 ### 模型训练
 
 [参考链接](https://docs.ultralytics.com/tasks/classify/)
