@@ -98,7 +98,7 @@ if __name__ == "__main__":
     parser.add_argument('--no_target_dir', type=str,
                         default="/mnt/data2/all_species_240916/no_target", help='没有动物和人类的照片目录')
     parser.add_argument('--target_dir', type=str,
-                        default="/mnt/data2/image_classifier_data", help='物种分类的数据目录')
+                        default="/home/yuzhong/data1/image_classifier_data", help='物种分类的数据目录')
     parser.add_argument('--max_workers', type=int,
                         default=6, help='多进程的进程数量')
     args = parser.parse_args()
