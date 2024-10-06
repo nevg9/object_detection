@@ -128,7 +128,7 @@ def main():
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.DEBUG,
+        level=logging.INFO,
         handlers=[
             logging.FileHandler(log_file_name, mode='a'),
             logging.StreamHandler(sys.stdout)
@@ -332,8 +332,9 @@ def main():
                 break
 
         model.eval()
-        logging.info("***** Evaluating *****")
-        for step, batch in enumerate(eval_dataloader):
+        if accelerator.is_local_main_process:
+            logging.info("***** Evaluating *****")
+        for step, batch in tqdm(enumerate(eval_dataloader), disable=not accelerator.is_local_main_process, desc="Evaluating"):
             with torch.no_grad():
                 outputs = model(batch['img'])
             predictions = outputs.argmax(dim=-1)
@@ -344,7 +345,8 @@ def main():
             )
 
         eval_metric = metric.compute()
-        logger.info(f"epoch {epoch}: {eval_metric}")
+        if accelerator.is_local_main_process:
+            logger.info(f"epoch {epoch}: {eval_metric}")
 
         if args.with_tracking:
             accelerator.log(
