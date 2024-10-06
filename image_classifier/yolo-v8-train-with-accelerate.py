@@ -202,7 +202,7 @@ def main():
             p.requires_grad = True  # for training
         model = model.float()
         return model
-    model = load_yolo_model("/mnt/data1/models/yolo/yolov8m-cls.pt", nc)
+    model = load_yolo_model(args.model_name_or_path, nc)
 
     # Optimizer
     no_decay = ["bias", "LayerNorm.weight"]
