@@ -129,7 +129,7 @@ def main(args):
             img_files_all_result.extend(img_files)
     eval_metric = metric.compute()
     accelerator.print(f"eval_metric:{eval_metric}")
-    with open(args.csv_file, "w", newline='') as csvfile:
+    with open(args.evaluat_csv_file, "w", newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["label", "predict", "img_file"])
         for labeld, predict, imfile in zip(references_all_result, predict_all_result, img_files_all_result):
@@ -161,10 +161,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint_path",
         type=str,
-        default='/home/yuzhong/data1/code/object_detection/image_classifier/epoch_31/model.safetensors',
+        default='/home/yuzhong/data1/code/object_detection/image_classifier/epoch_28/model.safetensors',
     )
     parser.add_argument(
-        "--csv_file",
+        "--evaluat_csv_file",
         type=str,
         default='./evaluate_result.csv',
     )
