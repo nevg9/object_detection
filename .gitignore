@@ -38,3 +38,5 @@ ENV/
 *.json
 *.csv
 *.log.*
+*epoch_*
+object_detection/all_species_240916/*
