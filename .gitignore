@@ -40,3 +40,4 @@ ENV/
 *.log.*
 *epoch_*
 object_detection/all_species_240916/*
+object_detection/yolo11x.pt
