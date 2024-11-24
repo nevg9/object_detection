@@ -151,22 +151,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test_set",
         type=str,
-        default="/home/yuzhong/data1/image_classifier_data/test",
+        default="/mnt/data1/model_1122/image_classifier/test",
     )
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/home/yuzhong/data1/models/yolo/yolov8m-cls.pt",
+        default="/mnt/data1/model_1122/image_classifier/yolov8m-cls.pt",
     )
     parser.add_argument(
         "--checkpoint_path",
         type=str,
-        default='/home/yuzhong/data1/code/object_detection/image_classifier/epoch_28/model.safetensors',
+        default='/mnt/data1/model_1122/image_classifier/epoch_30/model.safetensors',
     )
     parser.add_argument(
         "--evaluat_csv_file",
         type=str,
-        default='./evaluate_result.csv',
+        default='/mnt/data1/model_1122/image_classifier/test/evaluate_result.csv',
     )
     args = parser.parse_args()
     main(args)

@@ -67,9 +67,9 @@ def read_name_to_detail(file_name):
     return data_dict
 
 
-weights_detection = "/home/yuzhong/data1/yuzhong/image_detection/species_43_model/best.onnx"
-data_file = "/home/yuzhong/data1/yuzhong/image_detection/species_43_model/species_43.yaml"
-name_detail_file = "/home/yuzhong/data1/yuzhong/image_detection/species_43_model/species_43_class_gender_age.json"
+weights_detection = "/mnt/data1/model_0925/image_detection/species_43_model/best.onnx"
+data_file = "/mnt/data1/model_0925/image_detection/species_43_model/species_43.yaml"
+name_detail_file = "/mnt/data1/model_0925/image_detection/species_43_model/species_43_class_gender_age.json"
 imgsz = [640, 640]
 app.config['detect_model'], app.config['detect_imgsz'], app.config['detect_device'] = load_detect_mode(device=1,
                                                                                                        weights=weights_detection,
@@ -80,7 +80,7 @@ app.config['detect_class_detail_dict'] = read_name_to_detail(name_detail_file)
 
 def load_classifier_model():
     """加载模型并返回"""
-    return torch.jit.load("/home/yuzhong/data1/yuzhong/image_classifier/image_classifier_model.pt")
+    return torch.jit.load("/mnt/data1/model_0925/image_classifier/image_classifier_model.pt")
 
 
 app.config['classifier_model'] = load_classifier_model()
