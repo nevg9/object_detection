@@ -38,9 +38,9 @@ def send_image_to_server(image_path, url, resource_id="12341234", media_type="ph
 
 
 if __name__ == '__main__':
-    image_path = '/root/test.jpg'
+    image_path = '/home/yuzhong/data1/image_classifier_data/test/human/SCNR015X-X00131-20180416-00252.jpg'
     # 空白照片识别的url
-    # url = 'http://localhost:5000/predict_classifier'
+    url = 'http://10.253.1.50:5002/predict_classifier'
     # 目标识别的url
-    url = 'http://localhost:5000/predict_detect'
+    # url = 'http://10.253.1.50:5000/predict_detect'
     send_image_to_server(image_path, url)
