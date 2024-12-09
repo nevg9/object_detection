@@ -1,27 +1,25 @@
 from flask import Flask, jsonify, request
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 from torchvision import models, transforms
 import torch.nn.functional as F
 import io
 import cv2
 from ultralytics import YOLO
 from ultralytics.nn.tasks import torch_safe_load, ClassificationModel
-import torch
 from safetensors.torch import load_file
 from ultralytics.data.dataset import classify_transforms
-from PIL import Image
 import sys
 from pathlib import Path
 import numpy as np
-import torch
-import json
-from utils.torch_utils import select_device, smart_inference_mode
+from ultralytics.data.utils import exif_size, IMG_FORMATS, FORMATS_HELP_MSG
 import time
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"  # 指定使用 GPU 0
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory

@@ -1,4 +1,4 @@
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFile
 from ultralytics.data.utils import exif_size, IMG_FORMATS, FORMATS_HELP_MSG
 import os
 import logging
@@ -6,7 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
 import cv2
-
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None  # 清空缓存，防止旧图像缓存
 # 获取当前文件名（不带扩展名）
 file_name = os.path.splitext(os.path.basename(__file__))[0]
