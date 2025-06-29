@@ -17,6 +17,7 @@ import time
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
+import av
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"  # 指定使用 GPU 0
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -155,12 +156,12 @@ def process_predict(results):
             class_name = result.names[class_id]
 
             class_name_copy = class_name
-            gender = "无法区分"
+            gender = "难以鉴定"
             for gd in gender_set:
                 if gd in class_name_copy:
                     class_name_copy = class_name_copy.replace(gd, "")
                     gender = gd
-            age = "无法区分"
+            age = "难以鉴定"
             for ag in age_set:
                 if ag in class_name_copy:
                     class_name_copy = class_name_copy.replace(ag, "")
@@ -194,6 +195,70 @@ def predict_detect():
     if media_type:
         results_dict['mediaType'] = media_type
     return jsonify(results_dict)
+
+@app.route('/predict_video', methods=['POST'])
+def predict_video():
+    start = time.time()
+    video_bytes = request.data
+    resource_id = request.headers.get('resourceId')
+    media_type  = request.headers.get('mediaType')
+
+    # ---------- ① decode ----------
+    container = av.open(io.BytesIO(video_bytes))
+    fps = container.streams.video[0].average_rate
+    frames_json = []                 # 存放逐帧结果
+
+    stride   = 1                     # 每 2 帧跑一次检测（可调）
+    device   = app.config["device"]
+    det_model  = app.config['detect_model']
+    cls_model  = app.config['classifier_model']
+    tfms       = app.config['torch_transforms']
+    idx = 0;
+    sp = 0
+    for _, frame in enumerate(container.decode(video=0)):
+        if idx % stride:             # 跳帧
+            continue
+        img_bgr = frame.to_ndarray(format="bgr24")
+        # ---------- ② 先用分类模型快速筛 “有没有目标” ----------
+        pil = Image.fromarray(img_bgr[..., ::-1])
+        sample = tfms(pil).unsqueeze(0).to(device)
+        cls_logits = cls_model(sample)
+        _, top = cls_logits.softmax(1).max(1)
+        # 没有动物就跳过
+        if top.item() != 0:
+            idx += 1
+            continue                 # 这帧无目标，直接跳
+
+        # ---------- ③ 真正目标检测 ----------
+        det_res = det_model.predict(img_bgr, conf=0.25)
+        frame_dict = process_predict(det_res)   # 你已有的函数
+
+        # 统计 summary
+        # for _, (_, cnt) in enumerate(frame_dict['agg_results']):
+        sp += len(frame_dict['agg_results'])  # 物种中文名
+
+        # 填帧信息
+        frame_dict['frame_id'] = idx
+        frame_dict['ts_ms']  = round(idx * 1000 / fps)
+        idx += 1
+        frames_json.append(frame_dict)
+
+    # ---------- ④ 汇总 ----------
+    summary = {
+        "species_accumulate": sp,
+        "duration_frames": idx,
+        "duration_ms": round((idx + 1) * 1000 / fps)
+    }
+    resp = dict(
+        frames=frames_json,
+        summary=summary,
+        processing_ms=round((time.time() - start) * 1000)
+    )
+    if resource_id: 
+        resp['resourceId'] = resource_id
+    if media_type:  
+        resp['mediaType']  = media_type
+    return jsonify(resp)
 
 
 if __name__ == '__main__':
