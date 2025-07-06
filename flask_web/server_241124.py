@@ -40,7 +40,8 @@ log_handler = TimedRotatingFileHandler(
     backupCount=7  # 保留的旧日志文件数量
 )
 log_handler.setLevel(logging.INFO)
-log_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+log_handler.setFormatter(logging.Formatter(
+    '%(asctime)s %(levelname)s %(message)s'))
 app.logger.addHandler(log_handler)  # 添加日志处理程序
 app.logger.setLevel(logging.INFO)
 app.logger.info('Flask application started')  # 启动时记录一条日志
@@ -67,7 +68,8 @@ app.config['classifier_model'] = model
 app.config["torch_transforms"] = classify_transforms(size=224)
 app.config['classifier_detail'] = {0: '动物', 1: '人类', 2: '无目标'}
 
-app.config['detect_model'] = YOLO("/mnt/data1/model_1122/image_detection/best.engine", task="detect")
+app.config['detect_model'] = YOLO(
+    "/mnt/data1/model_1122/image_detection/best.engine", task="detect")
 app.config['gender_set'] = {"雄性", "雌性"}
 app.config['age_set'] = {'成体', '亚成体', "幼体"}
 
@@ -97,7 +99,8 @@ def predict_classifier():
     # binary_to_jpg(binary_data)
     # 获取已加载的模型
     model = app.config['classifier_model']
-    processed_image = process_image_classifier_image(binary_data, app.config["torch_transforms"], app.config["device"])
+    processed_image = process_image_classifier_image(
+        binary_data, app.config["torch_transforms"], app.config["device"])
     if processed_image is None:
         response_data = {}
         if resource_id:
@@ -116,7 +119,8 @@ def predict_classifier():
         F.softmax(predict_value, dim=1), dim=1)
     end_time = time.time()  # 开始时间
     processing_time = (end_time - start_time) * 1000  # 计算耗时（单位：毫秒）
-    app.logger.info(f"classifier processing time: {processing_time} ms, process image time: {image_time} ms")
+    app.logger.info(
+        f"classifier processing time: {processing_time} ms, process image time: {image_time} ms")
     # 构建返回数据
     response_data = {
         'prediction': max_prob.item(),
@@ -167,7 +171,8 @@ def process_predict(results):
                     class_name_copy = class_name_copy.replace(ag, "")
                     age = ag
             class_id_2_detail_dict[class_id] = [class_name_copy, gender, age]
-            detect_class.append((class_name, (x1, y1, x2, y2), confidence, [class_name_copy, gender, age]))
+            detect_class.append((class_name, (x1, y1, x2, y2), confidence, [
+                                class_name_copy, gender, age]))
             # print(f"检测到 {class_name} - 置信度: {confidence:.2f}")
             # print(f"位置: x1={x1:.1f}, y1={y1:.1f}, x2={x2:.1f}, y2={y2:.1f}")
     for k, v in classs_id_2_num.items():
@@ -196,28 +201,30 @@ def predict_detect():
         results_dict['mediaType'] = media_type
     return jsonify(results_dict)
 
+
 @app.route('/predict_video', methods=['POST'])
 def predict_video():
     start = time.time()
     video_bytes = request.data
     resource_id = request.headers.get('resourceId')
-    media_type  = request.headers.get('mediaType')
+    media_type = request.headers.get('mediaType')
 
     # ---------- ① decode ----------
     container = av.open(io.BytesIO(video_bytes))
-    fps = container.streams.video[0].average_rate
     frames_json = []                 # 存放逐帧结果
 
-    stride   = 1                     # 每 2 帧跑一次检测（可调）
-    device   = app.config["device"]
-    det_model  = app.config['detect_model']
-    cls_model  = app.config['classifier_model']
-    tfms       = app.config['torch_transforms']
-    idx = 0;
+    stride = 1                     # 每 2 帧跑一次检测（可调）
+    device = app.config["device"]
+    det_model = app.config['detect_model']
+    cls_model = app.config['classifier_model']
+    tfms = app.config['torch_transforms']
+    last_ts_ms = 0
     sp = 0
-    for _, frame in enumerate(container.decode(video=0)):
-        if idx % stride:             # 跳帧
+    for frame_idx, frame in enumerate(container.decode(video=0)):
+        if frame_idx % stride:             # 跳帧
             continue
+        ts_ms = frame.time * 1000
+        last_ts_ms = ts_ms
         img_bgr = frame.to_ndarray(format="bgr24")
         # ---------- ② 先用分类模型快速筛 “有没有目标” ----------
         pil = Image.fromarray(img_bgr[..., ::-1])
@@ -226,7 +233,6 @@ def predict_video():
         _, top = cls_logits.softmax(1).max(1)
         # 没有动物就跳过
         if top.item() != 0:
-            idx += 1
             continue                 # 这帧无目标，直接跳
 
         # ---------- ③ 真正目标检测 ----------
@@ -238,26 +244,29 @@ def predict_video():
         sp += len(frame_dict['agg_results'])  # 物种中文名
 
         # 填帧信息
-        frame_dict['frame_id'] = idx
-        frame_dict['ts_ms']  = round(idx * 1000 / fps)
-        idx += 1
+        frame_dict['frame_id'] = frame_idx
+        frame_dict['ts_ms'] = round(ts_ms)
         frames_json.append(frame_dict)
-
+    # duration
+    if container.duration is not None:
+        duration_ms = container.duration / av.time_base * 1000
+    else:
+        duration_ms = last_ts_ms
     # ---------- ④ 汇总 ----------
     summary = {
         "species_accumulate": sp,
-        "duration_frames": idx,
-        "duration_ms": round((idx + 1) * 1000 / fps)
+        "duration_frames": frame_idx + 1,
+        "duration_ms": round(duration_ms)
     }
     resp = dict(
         frames=frames_json,
         summary=summary,
         processing_ms=round((time.time() - start) * 1000)
     )
-    if resource_id: 
+    if resource_id:
         resp['resourceId'] = resource_id
-    if media_type:  
-        resp['mediaType']  = media_type
+    if media_type:
+        resp['mediaType'] = media_type
     return jsonify(resp)
 
 

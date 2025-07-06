@@ -24,6 +24,7 @@ def send_video_to_server(video_path, url, resource_id="12341234", media_type="vi
     else:
         print(video_path, f"Request failed with status code {response.status_code}: {response.reason}")
 
+
 if __name__ == '__main__':
     url = 'http://localhost:5002/predict_video'
     video_path = '/mnt/data1/animal_sample250.mp4'
