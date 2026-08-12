@@ -225,6 +225,38 @@ sudo systemctl reload nginx
 
 所有一致性检查和压测通过后，停止旧进程，把 Nginx 监听端口从 `15002` 改回 `5002`，再次执行 `nginx -t` 后 reload。不要在新环境和旁路服务验证完成前停止旧进程。
 
+### 5002 无感切换
+
+不要直接停止旧服务后再启动 Nginx，这会产生端口空窗，而且旧服务的 Python 可执行文件已经丢失，停止后无法可靠重启。仓库提供了连接排空脚本：
+
+```bash
+cd /mnt/data1/code/object_detection
+
+# 只把新建的 5002 连接转发到 Nginx 15002；已有连接继续由旧服务完成。
+sudo flask_web/multi_gpu_server/scripts/cutover_5002.sh prepare
+
+# 检查旧连接数量、新服务健康和临时转发状态。
+sudo flask_web/multi_gpu_server/scripts/cutover_5002.sh status
+
+# 最多等待 30 分钟排空旧连接，然后停止旧进程、让 Nginx 同时监听
+# 5002/15002，最后撤销临时转发。
+sudo flask_web/multi_gpu_server/scripts/cutover_5002.sh finalize 1800
+```
+
+`prepare` 完成后，调用端仍请求原来的 5002，但所有新连接已经进入多 GPU 服务；此时旧进程仍然存活，可以使用下面的命令立即回滚：
+
+```bash
+sudo flask_web/multi_gpu_server/scripts/cutover_5002.sh rollback
+```
+
+如果等待结束后仍有已确认为空闲或无效的长连接，可以明确使用 `--force` 完成切换：
+
+```bash
+sudo flask_web/multi_gpu_server/scripts/cutover_5002.sh finalize 60 --force
+```
+
+脚本在每个危险步骤前都会重新检查 8 卡健康状态、systemd 服务、Nginx 和临时转发。旧进程停止以后，临时转发会一直保留到 Nginx 确认监听 5002；如果最终健康检查失败，脚本会自动恢复转发到 15002。
+
 常用排查命令：
 
 ```bash
