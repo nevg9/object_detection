@@ -1,0 +1,7 @@
+[Unit]
+Description=Eight-GPU object-detection serving stack
+Wants=object-detection-worker@0.service object-detection-worker@1.service object-detection-worker@2.service object-detection-worker@3.service object-detection-worker@4.service object-detection-worker@5.service object-detection-worker@6.service object-detection-worker@7.service object-detection-gateway.service
+After=network.target
+
+[Install]
+WantedBy=multi-user.target

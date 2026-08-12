@@ -1,0 +1,22 @@
+[Unit]
+Description=Object detection public API gateway and fair scheduler
+After=network.target object-detection-worker@0.service object-detection-worker@1.service object-detection-worker@2.service object-detection-worker@3.service object-detection-worker@4.service object-detection-worker@5.service object-detection-worker@6.service object-detection-worker@7.service
+
+[Service]
+Type=simple
+User=yuzhong
+Group=yuzhong
+EnvironmentFile=/etc/object-detection/object-detection.env
+ExecStart=/mnt/data1/code/object_detection/flask_web/multi_gpu_server/scripts/run_gateway.sh
+Restart=always
+RestartSec=3
+TimeoutStartSec=60
+TimeoutStopSec=35
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/mnt/data2/object_detection
+
+[Install]
+WantedBy=object-detection.target

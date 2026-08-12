@@ -1,0 +1,13 @@
+[Unit]
+Description=Clean orphan object-detection request files and old logs
+
+[Service]
+Type=oneshot
+User=yuzhong
+Group=yuzhong
+EnvironmentFile=/etc/object-detection/object-detection.env
+ExecStart=/mnt/data1/code/object_detection/flask_web/multi_gpu_server/scripts/run_cleanup.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/mnt/data2/object_detection

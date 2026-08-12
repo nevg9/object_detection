@@ -1,0 +1,22 @@
+[Unit]
+Description=Object detection GPU worker %i
+After=network.target
+
+[Service]
+Type=simple
+User=yuzhong
+Group=yuzhong
+EnvironmentFile=/etc/object-detection/object-detection.env
+ExecStart=/mnt/data1/code/object_detection/flask_web/multi_gpu_server/scripts/run_worker.sh %i
+Restart=always
+RestartSec=3
+TimeoutStartSec=180
+TimeoutStopSec=35
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/mnt/data2/object_detection
+
+[Install]
+WantedBy=object-detection.target
