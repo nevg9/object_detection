@@ -58,6 +58,18 @@
 sudo mkdir -p /opt/object-detection
 sudo chown yuzhong:yuzhong /opt/object-detection
 /home/yuzhong/miniconda3/bin/conda create -p /opt/object-detection/venv python=3.10.15 -y
+
+# PyAV 14.4.0 已从公开 PyPI 下架，但旧环境中保留着完整的
+# cp310 manylinux wheel 文件。先把它无损重建为本机 wheel，确保视频
+# 解码版本与旧服务完全一致。
+av_wheel_stage="$(mktemp -d /tmp/od-av-wheel.XXXXXX)"
+mkdir -p /home/yuzhong/.wheelhouse
+cp -a /home/yuzhong/miniconda3/envs/torch2/lib/python3.10/site-packages/av "${av_wheel_stage}/"
+cp -a /home/yuzhong/miniconda3/envs/torch2/lib/python3.10/site-packages/av.libs "${av_wheel_stage}/"
+cp -a /home/yuzhong/miniconda3/envs/torch2/lib/python3.10/site-packages/av-14.4.0.dist-info "${av_wheel_stage}/"
+/opt/object-detection/venv/bin/wheel pack "${av_wheel_stage}" -d /home/yuzhong/.wheelhouse
+/opt/object-detection/venv/bin/pip install /home/yuzhong/.wheelhouse/av-14.4.0-*.whl
+
 /opt/object-detection/venv/bin/pip install -r /mnt/data1/code/object_detection/flask_web/multi_gpu_server/requirements.lock
 
 sudo mkdir -p /mnt/data2/object_detection/spool /mnt/data2/object_detection/logs

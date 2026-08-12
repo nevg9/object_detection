@@ -1,6 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu124
 
-av==14.4.0
+# PyAV 14.4.0 uses the reconstructed legacy wheel documented in README.md.
 Flask==3.0.3
 gunicorn==23.0.0
 numpy==1.26.3
