@@ -54,23 +54,41 @@
 
 不要修复或覆盖当前 `torch2` 环境。它的 Python 3.10 可执行文件已经被升级操作删除，当前旧服务只能依靠内存中的进程继续运行。
 
-```bash
-sudo mkdir -p /opt/object-detection
-sudo chown yuzhong:yuzhong /opt/object-detection
-/home/yuzhong/miniconda3/bin/conda create -p /opt/object-detection/venv python=3.10.15 -y
+这台服务器当前采用下面的兼容快照方式。新 Python 环境和包目录都是独立路径；`cp -al` 只创建硬链接，不复制约 9.5GB 的包内容，也不会修改旧目录。即使以后删除旧目录，快照中的硬链接仍然有效。
 
-# PyAV 14.4.0 已从公开 PyPI 下架，但旧环境中保留着完整的
-# cp310 manylinux wheel 文件。先把它无损重建为本机 wheel，确保视频
-# 解码版本与旧服务完全一致。
+```bash
+/home/yuzhong/miniconda3/bin/conda create \
+  -p /home/yuzhong/.venvs/object-detection \
+  python=3.10.15 pip=24.2 -y
+
+mkdir -p /home/yuzhong/.venvs/object-detection-legacy-packages
+cp -al \
+  /home/yuzhong/miniconda3/envs/torch2/lib/python3.10/site-packages/. \
+  /home/yuzhong/.venvs/object-detection-legacy-packages/
+
+/home/yuzhong/.venvs/object-detection/bin/pip install \
+  --no-deps gunicorn==23.0.0
+
+export PYTHONPATH=/home/yuzhong/.venvs/object-detection-legacy-packages
+/home/yuzhong/.venvs/object-detection/bin/python -m pip check
+```
+
+如果不能使用现有包快照，也可以按锁文件从头安装。PyAV 14.4.0 已从公开 PyPI 下架，需要先从旧包目录无损重建本机 wheel：
+
+```bash
+
 av_wheel_stage="$(mktemp -d /tmp/od-av-wheel.XXXXXX)"
 mkdir -p /home/yuzhong/.wheelhouse
 cp -a /home/yuzhong/miniconda3/envs/torch2/lib/python3.10/site-packages/av "${av_wheel_stage}/"
 cp -a /home/yuzhong/miniconda3/envs/torch2/lib/python3.10/site-packages/av.libs "${av_wheel_stage}/"
 cp -a /home/yuzhong/miniconda3/envs/torch2/lib/python3.10/site-packages/av-14.4.0.dist-info "${av_wheel_stage}/"
-/opt/object-detection/venv/bin/wheel pack "${av_wheel_stage}" -d /home/yuzhong/.wheelhouse
-/opt/object-detection/venv/bin/pip install /home/yuzhong/.wheelhouse/av-14.4.0-*.whl
+/home/yuzhong/.venvs/object-detection/bin/wheel pack \
+  "${av_wheel_stage}" -d /home/yuzhong/.wheelhouse
+/home/yuzhong/.venvs/object-detection/bin/pip install \
+  /home/yuzhong/.wheelhouse/av-14.4.0-*.whl
 
-/opt/object-detection/venv/bin/pip install -r /mnt/data1/code/object_detection/flask_web/multi_gpu_server/requirements.lock
+/home/yuzhong/.venvs/object-detection/bin/pip install \
+  -r /mnt/data1/code/object_detection/flask_web/multi_gpu_server/requirements.lock
 
 sudo mkdir -p /mnt/data2/object_detection/spool /mnt/data2/object_detection/logs
 sudo chown -R yuzhong:yuzhong /mnt/data2/object_detection
@@ -81,7 +99,10 @@ chmod 750 /mnt/data2/object_detection/logs
 验证依赖和 GPU：
 
 ```bash
-/opt/object-detection/venv/bin/python -c 'import torch, flask, tensorrt, ultralytics; print(torch.__version__, torch.cuda.device_count())'
+set -a
+source /mnt/data1/code/object_detection/flask_web/multi_gpu_server/deploy/object-detection.env.example
+set +a
+/home/yuzhong/.venvs/object-detection/bin/python -c 'import torch, flask, tensorrt, ultralytics; print(torch.__version__, torch.cuda.device_count())'
 nvidia-smi -L
 ```
 
@@ -133,12 +154,12 @@ curl -X POST 'http://127.0.0.1:5090/predict_detect' \
 也可以使用仓库中的 Python 示例：
 
 ```bash
-/opt/object-detection/venv/bin/python -m flask_web.multi_gpu_server.request_example \
+/home/yuzhong/.venvs/object-detection/bin/python -m flask_web.multi_gpu_server.request_example \
   /path/to/photo.jpg \
   --url http://127.0.0.1:5090 \
   --endpoint predict_classifier
 
-/opt/object-detection/venv/bin/python -m flask_web.multi_gpu_server.request_example \
+/home/yuzhong/.venvs/object-detection/bin/python -m flask_web.multi_gpu_server.request_example \
   /path/to/photo.jpg \
   --url http://127.0.0.1:5090 \
   --endpoint predict_detect
@@ -149,7 +170,7 @@ curl -X POST 'http://127.0.0.1:5090/predict_detect' \
 旧服务保持在 `http://127.0.0.1:5002`，新服务先通过旁路端口提供访问，例如 `http://127.0.0.1:15002`。准备多张包含动物、人、空白和多目标场景的图片，然后执行：
 
 ```bash
-/opt/object-detection/venv/bin/python -m flask_web.multi_gpu_server.consistency_check \
+/home/yuzhong/.venvs/object-detection/bin/python -m flask_web.multi_gpu_server.consistency_check \
   --old-url http://127.0.0.1:5002 \
   --new-url http://127.0.0.1:15002 \
   --images /path/to/compatibility-images
@@ -158,7 +179,7 @@ curl -X POST 'http://127.0.0.1:5090/predict_detect' \
 同时验证现有视频样本：
 
 ```bash
-/opt/object-detection/venv/bin/python -m flask_web.multi_gpu_server.consistency_check \
+/home/yuzhong/.venvs/object-detection/bin/python -m flask_web.multi_gpu_server.consistency_check \
   --old-url http://127.0.0.1:5002 \
   --new-url http://127.0.0.1:15002 \
   --video /mnt/data1/animal_sample250.mp4
@@ -169,7 +190,7 @@ curl -X POST 'http://127.0.0.1:5090/predict_detect' \
 ## 并发压测
 
 ```bash
-/opt/object-detection/venv/bin/python -m flask_web.multi_gpu_server.load_test \
+/home/yuzhong/.venvs/object-detection/bin/python -m flask_web.multi_gpu_server.load_test \
   --url http://127.0.0.1:15002 \
   --images /path/to/load-test-images \
   --concurrency 64 \
