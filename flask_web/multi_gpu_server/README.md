@@ -223,7 +223,7 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-所有一致性检查和压测通过后，停止旧进程，把 Nginx 监听端口从 `15002` 改回 `5002`，再次执行 `nginx -t` 后 reload。不要在新环境和旁路服务验证完成前停止旧进程。
+所有一致性检查和压测通过后，使用下一节的连接排空脚本切换生产入口。不要直接停止旧进程，也不要在新环境和旁路服务验证完成前切换生产入口。
 
 ### 5002 无感切换
 
@@ -256,6 +256,22 @@ sudo flask_web/multi_gpu_server/scripts/cutover_5002.sh finalize 60 --force
 ```
 
 脚本在每个危险步骤前都会重新检查 8 卡健康状态、systemd 服务、Nginx 和临时转发。旧进程停止以后，临时转发会一直保留到 Nginx 确认监听 5002；如果最终健康检查失败，脚本会自动恢复转发到 15002。
+
+### tmux 实时日志
+
+生产进程由 systemd 管理；`server` tmux 只作为不会影响服务生命周期的日志控制台，避免关闭 tmux 时向 Gunicorn 发送 SIGHUP。登录服务器后执行：
+
+```bash
+tmux attach -t server
+```
+
+日志控制台包含三个窗口：
+
+- `gateway-logs`：公网兼容接口、状态码和响应大小。
+- `gpu-logs`：每个请求使用的 GPU、分类/检测耗时和图片解码耗时。
+- `nginx-logs`：Nginx 访问日志和错误日志。
+
+使用 `Ctrl-b n` 切换到下一个窗口。新服务默认关闭 Ultralytics 的逐图片 `640x640 ...` 冗余输出，但 `gpu-logs` 会提供等价且更适合并发服务的结构化耗时记录。
 
 常用排查命令：
 

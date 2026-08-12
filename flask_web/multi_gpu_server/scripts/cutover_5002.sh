@@ -86,7 +86,10 @@ old_server_pid() {
   if [[ "${#pids[@]}" -gt 1 ]]; then
     die "multiple legacy server processes found: ${pids[*]}"
   fi
-  [[ "${#pids[@]}" -eq 1 ]] && printf '%s\n' "${pids[0]}"
+  if [[ "${#pids[@]}" -eq 1 ]]; then
+    printf '%s\n' "${pids[0]}"
+  fi
+  return 0
 }
 
 old_connection_count() {
