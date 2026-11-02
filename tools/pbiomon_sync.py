@@ -11,6 +11,7 @@ import base64
 import concurrent.futures
 import contextlib
 import datetime as dt
+import email.utils
 import fcntl
 import getpass
 import gzip
@@ -18,6 +19,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import random
 from pathlib import Path
 import shutil
 import signal
@@ -33,12 +35,59 @@ import urllib.request
 import uuid
 import hmac
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SCHEMA_VERSION = 1
 TZ = dt.timezone(dt.timedelta(hours=8))
 QUERY_PATH = "/api/infcam/final-identifications/query"
 RESOURCE_HOST = "resource.pbiomon.cn"
 DEFAULT_ROOT = "/mnt/data2/pbiomon_yolo"
+HELD_STATUSES = ('failed', 'blocked_url', 'no_url', 'unavailable', 'refresh_required', 'blocked_transport')
+
+
+def retry_after_seconds(value, reference_time=None):
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        if seconds >= 0 and seconds < float('inf'):
+            return seconds
+    except (ValueError, TypeError):
+        pass
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return max(0, parsed.timestamp() - (time.time() if reference_time is None else reference_time))
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def retry_policy(code, attempts, permanent=False, maximum=5, server_delay=None):
+    """404 is a held URL, not evidence that the storage file is permanently gone."""
+    if code.startswith('url_') or code == 'curl_exit_3':
+        return 'blocked_url', 0
+    if code in ('private_route_or_tls_mismatch', 'curl_exit_60', 'curl_exit_51'):
+        return 'blocked_transport', 0
+    if code in ('resource_http_404', 'resource_http_410'):
+        return 'unavailable', 0
+    if code in ('resource_http_401', 'resource_http_403'):
+        return 'refresh_required', 0
+    if code.startswith('resource_http_'):
+        try:
+            status = int(code.rsplit('_', 1)[1])
+        except ValueError:
+            status = 0
+        if 400 <= status < 500 and status not in (408, 429):
+            return 'failed', 0
+    if permanent or attempts >= maximum:
+        return 'failed', 0
+    delay = min(300, 30 * 2 ** min(max(attempts - 1, 0), 5))
+    delay += random.uniform(0, delay * 0.2)
+    if code == 'resource_http_429':
+        delay = max(65, delay)
+    if server_delay is not None:
+        delay = max(delay, server_delay)
+    return 'retry', delay
 
 
 def now():
@@ -148,6 +197,7 @@ class Store:
         for name in ("state", "raw/pages", "raw/objects", "raw/annotations", "raw/receipts", "raw/partial", "reports"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.claims_since_retry = 0
         self.db = sqlite3.connect(self.root / "state/state.sqlite", timeout=30, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -177,6 +227,7 @@ class Store:
           annotation_path TEXT, completed_at TEXT,
           PRIMARY KEY(resource_type,resource_id));
         CREATE INDEX IF NOT EXISTS resources_queue ON resources(status,resource_type,retry_after);
+        CREATE INDEX IF NOT EXISTS resources_work_queue ON resources(status,resource_type,retry_after,first_seen_at,resource_id);
         CREATE INDEX IF NOT EXISTS resources_dirty ON resources(annotation_dirty);
         CREATE TABLE IF NOT EXISTS annotations(
           resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, species_id TEXT NOT NULL,
@@ -219,7 +270,7 @@ class Store:
             if existing and not new_scan:
                 if existing['end_date'] != end_date or existing['start_date'] != start_date:
                     raise RuntimeError("unfinished_run_has_different_date_range")
-                db.execute("UPDATE runs SET status='running' WHERE run_id=?", (existing['run_id'],))
+                db.execute("UPDATE runs SET status='running',finished_at=NULL WHERE run_id=?", (existing['run_id'],))
                 db.execute("UPDATE tasks SET status='pending' WHERE run_id=? AND status='running'", (existing['run_id'],))
                 return existing['run_id'], True
             if existing:
@@ -315,7 +366,7 @@ class Store:
                 status = desired
             elif status == 'no_url' and url:
                 status = 'pending'
-            elif status in ('failed', 'blocked_url') and url and prior['download_url'] != url:
+            elif status in ('failed', 'blocked_url', 'unavailable', 'refresh_required', 'blocked_transport') and url and prior['download_url'] != url:
                 status = 'pending'
             db.execute("UPDATE resources SET metadata_json=?,download_url=?,status=?,last_seen_at=? WHERE resource_type=? AND resource_id=?", (canonical(metadata), url, status, stamp, kind, rid))
             if prior['metadata_json'] != canonical(metadata) or prior['status'] != status:
@@ -369,28 +420,57 @@ class Store:
         with self.transaction() as db:
             return db.execute("UPDATE resources SET status='retry',attempts=0,retry_after=0,last_error=NULL,annotation_revision=annotation_revision+1,annotation_dirty=1 WHERE status='failed' AND download_url IS NOT NULL").rowcount
 
+    def settle_held_failures(self):
+        """Migrate the old hot retry queue; only run after taking the process lock."""
+        counts = {}
+        with self.transaction() as db:
+            for codes, state in [
+                (('resource_http_404', 'resource_http_410'), 'unavailable'),
+                (('resource_http_401', 'resource_http_403'), 'refresh_required'),
+            ]:
+                counts[state] = db.execute("UPDATE resources SET status=?,owner=NULL,retry_after=0,annotation_revision=annotation_revision+1,annotation_dirty=1 WHERE status IN ('retry','failed','pending') AND last_error IN (?,?)", (state, *codes)).rowcount
+            db.execute("INSERT INTO meta VALUES('retry_policy_version','2') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        return counts
+
+    def recheck_unavailable(self):
+        with self.transaction() as db:
+            return db.execute("UPDATE resources SET status='pending',attempts=0,retry_after=0,last_error=NULL,annotation_revision=annotation_revision+1,annotation_dirty=1 WHERE status='unavailable' AND download_url IS NOT NULL").rowcount
+
     def claim(self, preferred, owner):
         with self.transaction() as db:
-            for kind in preferred:
-                if kind not in self.include:
-                    continue
-                row = db.execute("SELECT * FROM resources WHERE resource_type=? AND status IN ('pending','retry') AND retry_after<=? ORDER BY first_seen_at,resource_id LIMIT 1", (kind, time.time())).fetchone()
-                if row:
-                    changed = db.execute("UPDATE resources SET status='downloading',owner=?,attempts=attempts+1 WHERE resource_type=? AND resource_id=? AND status IN ('pending','retry')", (owner, kind, row['resource_id'])).rowcount
-                    if changed:
-                        return dict(db.execute("SELECT * FROM resources WHERE resource_type=? AND resource_id=?", (kind, row['resource_id'])).fetchone())
+            # Reserve at most one preferred slot per nine fresh jobs for due
+            # transient retries. If no fresh work exists, retries drain normally.
+            states = ('retry', 'pending') if self.claims_since_retry >= 9 else ('pending', 'retry')
+            for state in states:
+                for kind in preferred:
+                    if kind not in self.include:
+                        continue
+                    row = db.execute("SELECT * FROM resources WHERE resource_type=? AND status=? AND retry_after<=? ORDER BY retry_after,first_seen_at,resource_id LIMIT 1", (kind, state, time.time())).fetchone()
+                    if row:
+                        changed = db.execute("UPDATE resources SET status='downloading',owner=?,attempts=attempts+1 WHERE resource_type=? AND resource_id=? AND status=?", (owner, kind, row['resource_id'], state)).rowcount
+                        if changed:
+                            self.claims_since_retry = 0 if state == 'retry' else self.claims_since_retry + 1
+                            return dict(db.execute("SELECT * FROM resources WHERE resource_type=? AND resource_id=?", (kind, row['resource_id'])).fetchone())
         return None
 
     def release_for_disk(self, row):
         with self.transaction() as db:
             db.execute("UPDATE resources SET status='retry',owner=NULL,retry_after=?,attempts=MAX(0,attempts-1),last_error='disk_reserve' WHERE resource_type=? AND resource_id=?", (time.time() + 60, row['resource_type'], row['resource_id']))
 
-    def failed(self, row, code, permanent=False, maximum=5):
-        status = 'blocked_url' if code.startswith('url_') else ('failed' if permanent or row['attempts'] >= maximum else 'retry')
-        delay = min(300, 5 * 2 ** min(row['attempts'], 6))
+    def failed(self, row, code, permanent=False, maximum=5, server_delay=None):
+        status, delay = retry_policy(code, row['attempts'], permanent, maximum, server_delay)
         with self.transaction() as db:
-            db.execute("UPDATE resources SET status=?,owner=NULL,last_error=?,retry_after=?,annotation_revision=annotation_revision+1,annotation_dirty=1 WHERE resource_type=? AND resource_id=?", (status, code, time.time() + delay, row['resource_type'], row['resource_id']))
+            current = db.execute("SELECT download_url FROM resources WHERE resource_type=? AND resource_id=?", (row['resource_type'], row['resource_id'])).fetchone()
+            if current and current['download_url'] and current['download_url'] != row['download_url']:
+                # An old in-flight URL must not block a newly refreshed URL.
+                db.execute("UPDATE resources SET status='pending',owner=NULL,attempts=0,retry_after=0,last_error=NULL,annotation_revision=annotation_revision+1,annotation_dirty=1 WHERE resource_type=? AND resource_id=?", (row['resource_type'], row['resource_id']))
+                return 'pending'
+            db.execute("UPDATE resources SET status=?,owner=NULL,last_error=?,retry_after=?,annotation_revision=annotation_revision+1,annotation_dirty=1 WHERE resource_type=? AND resource_id=?", (status, code, time.time() + delay if status == 'retry' else 0, row['resource_type'], row['resource_id']))
         return status
+
+    def held_count(self):
+        with self.lock:
+            return self.db.execute("SELECT COUNT(*) FROM resources WHERE status IN ({})".format(','.join('?' for _ in HELD_STATUSES)), HELD_STATUSES).fetchone()[0]
 
     def completed(self, row, receipt):
         with self.transaction() as db:
@@ -450,7 +530,7 @@ class Store:
             latest = self.db.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 1" if run_id is None else "SELECT * FROM runs WHERE run_id=?", () if run_id is None else (run_id,)).fetchone()
             tasks = [] if not latest else [{'status': r[0], 'count': r[1], 'pages': r[2], 'records_seen': r[3]} for r in self.db.execute("SELECT status,COUNT(*),SUM(page_number),SUM(records_seen) FROM tasks WHERE run_id=? GROUP BY status", (latest['run_id'],))]
             dirty = self.db.execute("SELECT COUNT(*) FROM resources WHERE annotation_dirty=1").fetchone()[0]
-            failures = [{'error': r[0], 'count': r[1]} for r in self.db.execute("SELECT last_error,COUNT(*) FROM resources WHERE status IN ('failed','blocked_url','no_url') GROUP BY last_error ORDER BY COUNT(*) DESC LIMIT 10")]
+            failures = [{'error': r[0], 'count': r[1]} for r in self.db.execute("SELECT last_error,COUNT(*) FROM resources WHERE status IN ({}) GROUP BY last_error ORDER BY COUNT(*) DESC LIMIT 10".format(','.join('?' for _ in HELD_STATUSES)), HELD_STATUSES)]
             transports = {r[0]: r[1] for r in self.db.execute("SELECT source_transport,COUNT(*) FROM resources WHERE status='done' GROUP BY source_transport")}
             metadata = dict(self.db.execute("SELECT key,value FROM meta WHERE key IN ('initial_requested_end_date','catalog_end_date')"))
         usage = shutil.disk_usage(self.root)
@@ -520,8 +600,8 @@ class Api:
 
 
 class DownloadError(Exception):
-    def __init__(self, code, permanent=False):
-        self.code, self.permanent = code, permanent
+    def __init__(self, code, permanent=False, retry_after=None):
+        self.code, self.permanent, self.retry_after = code, permanent, retry_after
         super().__init__(code)
 
 
@@ -557,7 +637,7 @@ class Downloader:
         if parsed.scheme != 'https' or parsed.hostname != RESOURCE_HOST or parsed.port not in (None, 443) or parsed.username is not None:
             raise DownloadError('url_not_allowed_private_host', True)
         fields = '%{http_code}\t%{remote_ip}\t%{size_download}\t%{content_type}\t%{ssl_verify_result}'
-        command = ['curl', '--config', '-', '--silent', '--show-error', '--fail', '--proto', '=https', '--connect-timeout', '10', '--max-time', '900' if row['resource_type'] == 'VIDEO' else '120', '--noproxy', '*', '--resolve', RESOURCE_HOST + ':443:' + self.private_ip, '--max-filesize', str(self.limits[row['resource_type']]), '--output', str(temp), '--write-out', fields]
+        command = ['curl', '--config', '-', '--silent', '--show-error', '--fail', '--globoff', '--path-as-is', '--proto', '=https', '--connect-timeout', '10', '--max-time', '900' if row['resource_type'] == 'VIDEO' else '120', '--noproxy', '*', '--resolve', RESOURCE_HOST + ':443:' + self.private_ip, '--max-filesize', str(self.limits[row['resource_type']]), '--dump-header', str(temp) + '.headers', '--output', str(temp), '--write-out', fields]
         # No --location: a redirect must never silently escape the private route.
         config = 'url = ' + json.dumps(row['download_url'], ensure_ascii=False) + '\n'
         return command, config
@@ -624,15 +704,26 @@ class Downloader:
                 except subprocess.TimeoutExpired:
                     continue
         parts = output.strip().split('\t')
+        server_delay = None
+        header_path = Path(str(temp) + '.headers')
+        if header_path.is_file():
+            # Only parse Retry-After; never log headers (which may contain tokens).
+            headers = header_path.read_bytes()[:65536].decode('iso-8859-1', 'replace')
+            for line in headers.splitlines():
+                if line.lower().startswith('retry-after:'):
+                    server_delay = retry_after_seconds(line.split(':', 1)[1].strip())
+            header_path.unlink()
+        if len(parts) == 5 and parts[0] != '000' and (parts[1] != self.private_ip or parts[4] != '0'):
+            raise DownloadError('private_route_or_tls_mismatch', True)
         if process.returncode:
             if len(parts) == 5 and parts[0] not in ('000', '200'):
-                raise DownloadError('resource_http_' + parts[0])
+                raise DownloadError('resource_http_' + parts[0], retry_after=server_delay)
             raise DownloadError('curl_exit_' + str(process.returncode), process.returncode == 63)
         if len(parts) != 5:
             raise DownloadError('invalid_curl_metrics')
         status, remote_ip, byte_count, content_type, tls = parts
         if status != '200':
-            raise DownloadError('resource_http_' + status, status.startswith('3'))
+            raise DownloadError('resource_http_' + status, status.startswith('3'), server_delay)
         if remote_ip != self.private_ip or tls != '0':
             raise DownloadError('private_route_or_tls_mismatch', True)
         if not temp.is_file() or temp.stat().st_size <= 0 or temp.stat().st_size != int(float(byte_count)):
@@ -656,7 +747,7 @@ class Downloader:
         finally:
             os.close(fd)
         temp.unlink()
-        receipt = {'schemaVersion': 1, 'resource_type': row['resource_type'], 'resource_id': row['resource_id'], 'file_path': str(target.relative_to(self.root)), 'sha256': hashed, 'byte_size': target.stat().st_size, 'file_mtime_ns': target.stat().st_mtime_ns, 'content_type': content_type, 'width': width, 'height': height, 'media': media, 'transport': 'private_https', 'remote_ip': remote_ip, 'tls_verified': True, 'completed_at': now()}
+        receipt = {'schemaVersion': 1, 'resource_type': row['resource_type'], 'resource_id': row['resource_id'], 'source_url_sha256': hashlib.sha256(row['download_url'].encode('utf-8')).hexdigest(), 'source_resource_metadata_sha256': digest(json.loads(row['metadata_json'])), 'file_path': str(target.relative_to(self.root)), 'sha256': hashed, 'byte_size': target.stat().st_size, 'file_mtime_ns': target.stat().st_mtime_ns, 'content_type': content_type, 'width': width, 'height': height, 'media': media, 'transport': 'private_https', 'remote_ip': remote_ip, 'tls_verified': True, 'completed_at': now()}
         # Receipt precedes the DB completion flag, permitting crash recovery.
         atomic_json(self.receipt_path(row), receipt)
         self.store.completed(row, receipt)
@@ -777,7 +868,7 @@ class Runner:
                     self.store.release_for_disk(row)
                     self.log('download_deferred', resource_key=row['resource_key'], error=exc.code)
                 else:
-                    state = self.store.failed(row, exc.code, exc.permanent, self.args.max_attempts)
+                    state = self.store.failed(row, exc.code, exc.permanent, self.args.max_attempts, exc.retry_after)
                     self.log('download_failed', resource_type=row['resource_type'], resource_key=row['resource_key'], error=exc.code, status=state)
             except Exception as exc:
                 code = 'worker_' + type(exc).__name__
@@ -808,12 +899,16 @@ class Runner:
             'resourceHost': RESOURCE_HOST,
             'privateResourceIp': self.args.private_ip,
             'sourceSnapshotGuaranteed': False,
+            'retryPolicyVersion': 2,
+            'notFoundPolicy': 'hold_until_url_changes_or_explicit_recheck',
         })
         recovered = self.store.recover_claims()
+        settled = self.store.settle_held_failures()
         damaged = self.store.reconcile_completed()
         retried = self.store.retry_failed() if self.args.retry_failed else 0
+        rechecked = self.store.recheck_unavailable() if self.args.recheck_unavailable else 0
         atomic_json(self.root / 'state/process.json', {'pid': os.getpid(), 'run_id': self.run_id, 'started_at': now(), 'hostname': socket.gethostname()})
-        self.log('run_started', run_id=self.run_id, resumed=resumed, recovered_claims=recovered, files_needing_repair=damaged, failed_tasks_retried=retried, include=self.args.include, private_ip=self.args.private_ip)
+        self.log('run_started', run_id=self.run_id, resumed=resumed, recovered_claims=recovered, settled_held_failures=settled, unavailable_explicitly_rechecked=rechecked, files_needing_repair=damaged, failed_tasks_retried=retried, include=self.args.include, private_ip=self.args.private_ip)
         self.write_summary()
         if ready_fd is not None:
             os.write(ready_fd, (canonical({'pid': os.getpid(), 'run_id': self.run_id, 'root': str(self.root)}) + '\n').encode())
@@ -855,7 +950,7 @@ class Runner:
                 else:
                     counts = dict(db.execute("SELECT status,COUNT(*) FROM tasks WHERE run_id=? GROUP BY status", (self.run_id,)))
                     pending = db.execute("SELECT COUNT(*) FROM resources WHERE status IN ('pending','retry','downloading')").fetchone()[0]
-                    failed = db.execute("SELECT COUNT(*) FROM resources WHERE status IN ('failed','blocked_url','no_url')").fetchone()[0]
+                    failed = db.execute("SELECT COUNT(*) FROM resources WHERE status IN ({})".format(','.join('?' for _ in HELD_STATUSES)), HELD_STATUSES).fetchone()[0]
                     status = 'paused' if pending or counts.get('pending') or counts.get('running') else ('completed_with_errors' if failed or counts.get('error') else 'complete')
                 db.execute("UPDATE runs SET status=?,finished_at=? WHERE run_id=?", (status, now(), self.run_id))
             summary = self.write_summary()
@@ -1034,6 +1129,7 @@ def main():
     run.add_argument('--max-seconds', type=float, default=0, help='bounded verification run; 0 means unlimited')
     run.add_argument('--new-scan', action='store_true')
     run.add_argument('--retry-failed', action='store_true')
+    run.add_argument('--recheck-unavailable', action='store_true', help='explicit one-off recheck after source missing URLs have been repaired')
     run.add_argument('--detach', action='store_true')
     run.set_defaults(func=run_command)
     for name, function in [('status', status_command), ('stop', stop_command), ('verify', verify_command)]:

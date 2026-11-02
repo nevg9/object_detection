@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 MODULE = Path(__file__).resolve().parents[1] / 'tools/pbiomon_sync.py'
 SPEC = importlib.util.spec_from_file_location('pbiomon_sync', MODULE)
@@ -193,6 +194,8 @@ class StateTests(unittest.TestCase):
         self.assertNotIn('--location', command)
         self.assertNotIn('--insecure', command)
         self.assertNotIn('-k', command)
+        self.assertIn('--globoff', command)
+        self.assertIn('--path-as-is', command)
         self.assertNotIn('do-not-log', ' '.join(command))
         self.assertIn('do-not-log', config)
 
@@ -241,6 +244,199 @@ class StateTests(unittest.TestCase):
             db.execute("UPDATE tasks SET status='complete' WHERE run_id=?", (historical,))
         self.store.finish_catalog(historical)
         self.assertEqual(self.store.summary()['coverage']['catalog_end_date'], '2026-11-01')
+
+    def test_resume_keeps_checkpoint_and_clears_paused_finish_time(self):
+        self.ingest([record()], 'resume-cursor')
+        with self.store.transaction() as db:
+            db.execute("UPDATE runs SET status='paused',finished_at=? WHERE run_id=?", (sync.now(),self.run))
+        run,resumed=self.store.create_or_resume_run('2026-11-02','2026-11-01',{})
+        self.assertTrue(resumed)
+        self.assertEqual(run,self.run)
+        self.assertEqual(self.store.task(self.task['task_id'])['cursor'],'resume-cursor')
+        self.assertIsNone(self.store.summary()['run']['finished_at'])
+
+    def test_404_is_held_after_first_attempt_without_losing_annotations(self):
+        self.ingest([record()], 'next')
+        row = self.store.claim(('PHOTO',), 'worker')
+        self.assertEqual(self.store.failed(row, 'resource_http_404'), 'unavailable')
+        self.assertEqual(self.resource()['attempts'], 1)
+        self.assertEqual(self.resource()['retry_after'], 0)
+        self.assertIsNone(self.store.claim(('PHOTO',), 'another'))
+        self.ingest([record(species='s2')])
+        self.assertEqual(self.resource()['status'], 'unavailable')
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM annotations').fetchone()[0], 2)
+        self.assertEqual(self.store.held_count(), 1)
+        self.assertEqual(self.store.summary()['failures'][0]['error'], 'resource_http_404')
+
+    def test_changed_url_releases_held_404_for_one_new_attempt(self):
+        self.ingest([record()], 'next')
+        row = self.store.claim(('PHOTO',), 'worker')
+        self.store.failed(row, 'resource_http_404')
+        self.ingest([record(url='https://resource.pbiomon.cn/repaired.jpg')])
+        self.assertEqual(self.resource()['status'], 'pending')
+        self.assertEqual(self.resource()['attempts'], 0)
+        self.assertEqual(self.store.claim(('PHOTO',), 'worker')['attempts'], 1)
+
+    def test_old_inflight_url_failure_does_not_block_refreshed_url(self):
+        self.ingest([record()], 'next')
+        old = self.store.claim(('PHOTO',), 'worker')
+        self.ingest([record(url='https://resource.pbiomon.cn/new-link.jpg')])
+        self.assertEqual(self.store.failed(old, 'resource_http_404'), 'pending')
+        self.assertEqual(self.resource()['attempts'], 0)
+
+    def test_generic_retry_flag_does_not_reactivate_held_missing_urls(self):
+        self.ingest([record()])
+        row = self.store.claim(('PHOTO',), 'worker')
+        self.store.failed(row, 'resource_http_404')
+        self.assertEqual(self.store.retry_failed(), 0)
+        self.assertEqual(self.resource()['status'], 'unavailable')
+        self.assertEqual(self.store.recheck_unavailable(), 1)
+        self.assertIsNotNone(self.store.claim(('PHOTO',), 'explicit-recheck'))
+
+    def test_legacy_hot_retry_queue_is_migrated_without_touching_transients(self):
+        self.ingest([record('A'),record('B'),record('C')])
+        with self.store.transaction() as db:
+            db.execute("UPDATE resources SET status='retry',attempts=2,last_error=? WHERE resource_id=?", ('resource_http_404','A'))
+            db.execute("UPDATE resources SET status='failed',attempts=5,last_error=? WHERE resource_id=?", ('resource_http_410','B'))
+            db.execute("UPDATE resources SET status='retry',attempts=1,last_error=? WHERE resource_id=?", ('resource_http_503','C'))
+        self.assertEqual(self.store.settle_held_failures()['unavailable'], 2)
+        self.assertEqual(self.resource('A')['status'], 'unavailable')
+        self.assertEqual(self.resource('B')['status'], 'unavailable')
+        self.assertEqual(self.resource('C')['status'], 'retry')
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM annotations').fetchone()[0], 3)
+
+    def test_fresh_work_has_priority_but_due_retries_do_not_starve(self):
+        self.ingest([record('0-retry')]+[record('F{:02d}'.format(i)) for i in range(10)])
+        with self.store.transaction() as db:
+            db.execute("UPDATE resources SET status='retry',retry_after=0 WHERE resource_id=?", ('0-retry',))
+        first = [self.store.claim(('PHOTO',), str(i)) for i in range(9)]
+        self.assertTrue(all(row['resource_id'].startswith('F') for row in first))
+        self.assertEqual(self.store.claim(('PHOTO',), 'retry-slot')['resource_id'], '0-retry')
+
+    def test_resource_auth_failures_wait_for_refresh_instead_of_hot_retry(self):
+        self.ingest([record()])
+        row = self.store.claim(('PHOTO',), 'worker')
+        self.assertEqual(self.store.failed(row, 'resource_http_403'), 'refresh_required')
+        self.assertIsNone(self.store.claim(('PHOTO',), 'worker'))
+
+    def fake_curl(self, status, peer='10.249.0.110', retry_after=None, body=b'synthetic transport body'):
+        def start(command, **kwargs):
+            output=Path(command[command.index('--output')+1])
+            output.write_bytes(body if status=='200' else b'')
+            headers='HTTP/1.1 '+status+' Test\r\n'
+            if retry_after:
+                headers+='Retry-After: '+retry_after+'\r\n'
+            Path(command[command.index('--dump-header')+1]).write_text(headers+'\r\n')
+            process=mock.Mock()
+            process.returncode=0 if status=='200' else 22
+            process.communicate.return_value=('\t'.join([status,peer,str(len(body) if status=='200' else 0),'image/jpeg','0']),'')
+            return process
+        return start
+
+    def test_resource_429_preserves_retry_after_from_real_header_parsing(self):
+        self.ingest([record()])
+        row=self.store.claim(('PHOTO',),'worker')
+        downloader=sync.Downloader(self.store,'10.249.0.110',1,threading.Event(),lambda *a,**k:None)
+        with mock.patch.object(sync.subprocess,'Popen',side_effect=self.fake_curl('429',retry_after='120')):
+            with self.assertRaises(sync.DownloadError) as caught:
+                downloader.download(row)
+        self.assertEqual(caught.exception.code,'resource_http_429')
+        self.assertEqual(caught.exception.retry_after,120)
+        self.store.failed(row,caught.exception.code,server_delay=caught.exception.retry_after)
+        self.assertGreaterEqual(self.resource()['retry_after'],sync.time.time()+119)
+
+    def test_failed_http_response_cannot_hide_an_unexpected_public_peer(self):
+        self.ingest([record()])
+        row=self.store.claim(('PHOTO',),'worker')
+        downloader=sync.Downloader(self.store,'10.249.0.110',1,threading.Event(),lambda *a,**k:None)
+        with mock.patch.object(sync.subprocess,'Popen',side_effect=self.fake_curl('404',peer='36.110.25.123')):
+            with self.assertRaises(sync.DownloadError) as caught:
+                downloader.download(row)
+        self.assertEqual(caught.exception.code,'private_route_or_tls_mismatch')
+
+    def test_new_receipt_preserves_source_link_and_metadata_hash_without_url(self):
+        self.ingest([record()])
+        row=self.store.claim(('PHOTO',),'worker')
+        downloader=sync.Downloader(self.store,'10.249.0.110',1,threading.Event(),lambda *a,**k:None)
+        with mock.patch.object(sync.subprocess,'Popen',side_effect=self.fake_curl('200')):
+            with mock.patch.object(downloader,'media_info',return_value=('.jpg',100,80,{'format':'test'})):
+                receipt,reused=downloader.download(row)
+        self.assertFalse(reused)
+        self.assertEqual(receipt['source_url_sha256'],sync.hashlib.sha256(row['download_url'].encode()).hexdigest())
+        self.assertEqual(receipt['source_resource_metadata_sha256'],sync.digest(json.loads(row['metadata_json'])))
+        self.assertNotIn('do-not-log',json.dumps(receipt))
+        self.assertEqual(self.resource()['status'],'done')
+
+
+class RetryPolicyTests(unittest.TestCase):
+    def test_transient_backoff_is_bounded_and_server_delay_is_honored(self):
+        with mock.patch.object(sync.random, 'uniform', return_value=0):
+            self.assertEqual(sync.retry_policy('resource_http_503', 1), ('retry',30))
+            self.assertEqual(sync.retry_policy('curl_exit_28', 2), ('retry',60))
+            self.assertEqual(sync.retry_policy('resource_http_429', 1), ('retry',65))
+            self.assertEqual(sync.retry_policy('resource_http_503', 1, server_delay=600), ('retry',600))
+            self.assertEqual(sync.retry_policy('curl_exit_28', 5), ('failed',0))
+
+    def test_status_specific_failures_are_not_implicitly_retried(self):
+        for code,state in [('resource_http_404','unavailable'),('resource_http_410','unavailable'),('resource_http_401','refresh_required'),('resource_http_403','refresh_required'),('resource_http_400','failed'),('curl_exit_3','blocked_url'),('curl_exit_60','blocked_transport')]:
+            with self.subTest(code=code):
+                self.assertEqual(sync.retry_policy(code,1),(state,0))
+
+    def test_retry_after_accepts_seconds_and_http_date(self):
+        self.assertEqual(sync.retry_after_seconds('120'),120)
+        self.assertEqual(sync.retry_after_seconds('Thu, 01 Jan 1970 00:02:00 GMT', reference_time=0),120)
+        self.assertIsNone(sync.retry_after_seconds('not-a-date'))
+        self.assertIsNone(sync.retry_after_seconds('-1'))
+
+
+class AssociationAuditTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec=importlib.util.spec_from_file_location('pbiomon_audit',MODULE.with_name('pbiomon_audit.py'))
+        cls.audit=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.audit)
+
+    def setUp(self):
+        self.annotation=self.audit.normalized_annotation(record())
+        self.resource={'resource_type':'PHOTO','resource_id':'A','sha256':'hash-A','file_path':'raw/objects/hash-A.jpg'}
+        self.annotations=[{'species_id':'s1','annotation_hash':sync.digest(self.annotation)}]
+        self.bundle={'resource':{'resourceType':'PHOTO','resourceId':'A'},'file':{'status':'done','sha256':'hash-A','path':'raw/objects/hash-A.jpg'},'annotations':[self.annotation]}
+
+    def test_correct_source_and_asset_mapping_passes(self):
+        self.assertTrue(self.audit.bundle_matches(self.bundle,self.resource,self.annotations))
+
+    def test_swapped_image_identity_or_object_is_detected(self):
+        changed=copy.deepcopy(self.bundle)
+        changed['resource']['resourceId']='B'
+        self.assertFalse(self.audit.bundle_matches(changed,self.resource,self.annotations))
+        changed=copy.deepcopy(self.bundle)
+        changed['file']['sha256']='hash-B'
+        self.assertFalse(self.audit.bundle_matches(changed,self.resource,self.annotations))
+
+    def test_missing_duplicate_or_changed_species_annotation_is_detected(self):
+        for entries in [[],[self.annotation,self.annotation]]:
+            changed=copy.deepcopy(self.bundle)
+            changed['annotations']=entries
+            self.assertFalse(self.audit.bundle_matches(changed,self.resource,self.annotations))
+        changed=copy.deepcopy(self.bundle)
+        changed['annotations'][0]['finalIdentification']['boxes'][0]['left']=99
+        self.assertFalse(self.audit.bundle_matches(changed,self.resource,self.annotations))
+
+    def test_receipt_source_hash_must_belong_to_same_observed_record_pair(self):
+        pairs={('url-A','metadata-A'),('url-B','metadata-B')}
+        self.assertTrue(self.audit.receipt_source_matches({'source_url_sha256':'url-A','source_resource_metadata_sha256':'metadata-A'},pairs))
+        self.assertFalse(self.audit.receipt_source_matches({'source_url_sha256':'url-A','source_resource_metadata_sha256':'metadata-B'},pairs))
+        self.assertFalse(self.audit.receipt_source_matches({'source_url_sha256':'other-resource-url'},pairs))
+
+    def test_legacy_receipt_is_reported_as_unproven_not_falsely_verified(self):
+        self.assertIsNone(self.audit.receipt_source_matches({'sha256':'local-hash'},set()))
+
+    def test_source_pair_is_stable_across_species_but_changes_with_asset_url(self):
+        first=record(species='s1')
+        second=record(species='s2')
+        self.assertEqual(self.audit.source_provenance_pair(first),self.audit.source_provenance_pair(second))
+        second['downloadUrl']='https://resource.pbiomon.cn/other.jpg'
+        self.assertNotEqual(self.audit.source_provenance_pair(first),self.audit.source_provenance_pair(second))
 
 
 class RangeTests(unittest.TestCase):
