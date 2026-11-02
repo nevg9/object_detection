@@ -4,6 +4,12 @@
 本工具归档原始数据，不转换未知坐标、不导出 YOLO 标签、不启动训练。
 本轮用户指定截止日期为 **2026-11-01（含当天，北京时间，最终鉴定首次完成日期）**。
 
+代码主干为 `main`，本地和服务器均跟踪 `origin/main`。服务器 Git 工作副本为
+`/mnt/data2/pbiomon_yolo/code/repository`；`bin/` 中正式入口指向该工作副本的工具文件。
+已验证的改动先在本地提交并推送 canonical `origin/main`，服务器再执行
+`git pull --ff-only`。数据、账本、回执和日志放在工作副本外；源码行为变更后才按需
+恢复进程载入新版，单纯分支指引调整且运行源码字节相同时不必重启下载。
+
 ## 数据与网络
 
 - API：`https://open.pbiomon.cn/api/infcam/final-identifications/query`。

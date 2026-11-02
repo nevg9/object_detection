@@ -10,5 +10,6 @@
 
 # Git workflow
 
-- This project's integration branch is `master`, as explicitly requested by the user. Completed and validated code changes must be committed and integrated into `master`; do not leave confirmed work only on a feature branch.
+- This project's default and integration branch is `main`, matching canonical `origin/HEAD` and the user's corrected instruction. Completed and validated changes must be integrated and pushed to `origin/main`; do not create or use `master` as a substitute for the existing main branch.
+- Keep the local checkout and the deployment checkout on `image0_processing` (`/mnt/data2/pbiomon_yolo/code/repository`) on `main`, tracking `origin/main`. Publish local changes through canonical `origin`, then synchronize the server with a fast-forward-only pull and verify commit and runtime-source identity.
 - Preserve unrelated user changes and only include files belonging to the completed task when committing or merging.
