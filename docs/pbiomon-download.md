@@ -61,6 +61,110 @@
 `null` 不猜测、不用空字符串代替。只有线上接口实际返回的属性才能补全，
 所有字段都有保存也不意味着每个字段都有非空业务值。
 
+## 统一存储与后续 YOLO 数据集
+
+### 全量下载和补标注共用一份归档
+
+这是当前实现的共同格式，不是为补标注另建的一套格式。两种模式都调用
+`Store._ingest_record()` 保存完整记录，再由同一个 `Store.export_annotations()`
+生成逐资源 JSON；`--annotations-only` 只改变媒体处理，不改变标注结构与位置。
+
+```text
+/mnt/data2/pbiomon_yolo/
+  state/state.sqlite
+  raw/
+    objects/<文件SHA256前2位>/<文件SHA256>.<扩展名>
+    receipts/<资源key前2位>/<资源key>.json
+    pages/<run_id>/<task_id>/<页号>-<响应摘要>.json.gz
+    annotations/
+      PHOTO/<资源key前2位>/<资源key>/current.json
+      VIDEO/<资源key前2位>/<资源key>/current.json
+      # 每个 current.json 同目录保留不可变的 <汇总摘要>.json 版本
+  reports/status.json
+```
+
+资源 key 由 `(resourceType, resourceId)` 计算；物种记录仍用三元组
+`(resourceType, resourceId, speciesId)`。不要用原文件名作为关联键：原文件名
+可能重复，多个资源还可能共享同一内容哈希文件。
+
+| 内容 | SQLite 当前记录 | 逐资源 JSON（两种模式相同，`schemaVersion=1`） |
+| --- | --- | --- |
+| 资源身份和拍摄/监测单元信息 | `resources.metadata_json` | `resource`，含 `resourceType`、`resourceId` 等原字段 |
+| 原始媒体关联 | `resources.file_path`、`sha256`、尺寸及状态 | `file.path`、`sha256`、`byteSize`、`width`、`height`、`status` |
+| 每个物种的全部标注 | `annotations.annotation_json` | `annotations[]` 中完整的 `speciesId`、`speciesName`、`finalIdentification`、`ai` |
+| 性别、年龄、行为、质量 | 同一 `annotation_json` 内的原属性数组 | `annotations[].finalIdentification.attributes[]` |
+| 图片框或视频逐帧框 | 同一 `annotation_json` 内的 `boxes[]` | 保留原坐标、单位、参考尺寸、`frameId`、`tsMs`、完整性和来源标记 |
+| 标注版本与原始响应来源 | `annotation_hash`、时间和 `source_page` | `provenance[]` 中的物种、标注摘要、首次观察/变更时间及源页 |
+| 图片 EXIF、视频流/容器信息 | `resources.media_json` | 下载回执的 `media`；当前汇总 JSON 的 `file` 不重复存这些信息 |
+
+`file.path`、`provenance[].sourcePage` 都相对归档根目录。后续读取器只需按
+`file.status == "done"` 选择有已下载媒体的记录，使用同一 JSON 解析逻辑，
+不需要知道记录来自全量下载还是补标注。
+补标注更新原路径下的 `current.json` 并保留旧版本，不改原图/视频路径、
+SHA256 或媒体完成时间；资源上各物种的属性分别保存，不跨物种合并。
+
+SQLite 是可查询的当前台账，`current.json` 是当前可读汇总，原始页与不可变
+汇总版本用于追溯。新训练版本应冻结输入的不可变汇总路径及各物种
+`annotationHash`，不能只记录会随下一轮补标注变化的 `current.json` 路径。
+
+### YOLO 训练使用独立、可复现的导出目录
+
+以下是约定的后续导出设计；当前下载工具不会创建这些训练文件或启动训练：
+
+```text
+exports/yolo/<数据集版本>/
+  data.yaml
+  classes.json
+  images/{train,val,test}/<样本key>.jpg
+  labels/{train,val,test}/<样本key>.txt
+  metadata/samples.jsonl
+  metadata/export.json
+  reports/excluded.jsonl
+```
+
+训练图片和同名标签遵循 [Ultralytics 检测数据格式](https://docs.ultralytics.com/datasets/detect/)：
+标签每个目标一行 `class_id x_center y_center width height`，类别从 0 开始，
+坐标以对应训练图片的宽高归一化到 0—1。性别、年龄和其他业务属性保留在
+完整源 JSON 与 `metadata/samples.jsonl` 中，不给标准检测 TXT 任意追加列；
+标准物种检测训练不会自动学习这些额外属性。
+
+导出约定：
+
+- `classes.json` 固定 `speciesId -> class_id` 及显示名称的映射，`data.yaml`
+  使用同一映射。已有类别 ID 不因物种名称修订或扫描顺序改变而重新排列。
+- 图片样本 key 使用资源 key；视频帧样本使用 `<资源key>__f<原始frameId>`。
+  原视频继续归档在 `raw/objects/`，检测训练使用对应的解码帧图片。
+- 视频只在已确认的原始帧上使用该帧的框，保留从 0 开始的原 `frameId`、
+  原 `tsMs`、实际解码时间及帧图片摘要；可变帧率时不能仅按 `时间 × FPS`
+  推算帧序号，不把视频级物种标注复制成每一帧的检测框。
+- 每条样本 metadata 记录样本 key、资源类型/ID、源媒体路径及 SHA256、
+  不可变标注版本路径、各物种 `annotationHash`、全部原属性和框、导出框与
+  源框下标的对应关系、坐标/方向变换规则、视频帧信息及所属数据划分。
+  属性仍位于各自的物种记录中，不能把属性数组按下标强配给某个框。
+- `export.json` 记录归档根、源扫描、导出代码提交、类别映射、筛选规则、
+  坐标规则、抽帧规则及数据划分规则。导出版本完成后不随新一轮补标注修改；
+  需要新标注时生成新版本。
+- 同一原视频及相同内容的媒体/帧不能同时分入训练集和验证/测试集。
+  可进一步按监测单元或拍摄事件分组，避免高度相近的素材跨集合。
+- 图片可引用原媒体；需要解码、方向修正或其他图像变换时生成派生图片，
+  不把训练预处理写回归档。原视频不为每个数据集版本再复制一份。
+
+### 当前 YOLO 导出边界
+
+目前接口的 `coordinateUnit=UNKNOWN`、参考画面尺寸未知，不能直接假设
+`left/top/width/height` 是原图像素坐标后除以宽高。先确认坐标单位、参考
+画面、图片 EXIF 方向/视频旋转、帧编号与时间含义，再按已确认规则换算，
+验证叠加结果并在导出 metadata 中记录证据和变换。原始标注值保持不变。
+
+只将媒体存在、坐标与帧映射可信且框标注满足本次训练要求的样本纳入检测集。
+有物种但无框、缺框、不完整框、未标注的视频帧不能自动当作无动物负样本；
+同一图片中已知存在却缺框的物种也不能静默丢弃。排除/待复核原因写入
+`reports/excluded.jsonl`，这类素材仍可保留作分类等任务的候选数据。
+
+性别/年龄等目前是“资源 × 物种 × 原鉴定项”属性，文档没有保证它与单个
+框对应。若后续要训练逐个动物的性别/年龄预测，需要先获得可靠的属性与框
+关联；现在先完整保存属性，不能把一个物种的某个属性套给所有同物种动物。
+
 ## 状态与完整性
 
 - 资源主键：`(resourceType, resourceId)`；物种明细主键：
@@ -271,3 +375,5 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_pbiomon_
 新增检查覆盖 v1.4 多项/重复/全空属性、旧记录原位补字段、图片和视频文件及
 回执不变、所有已有媒体队列状态不变、只补标注模式无媒体下载器或工作线程、
 有旧媒体积压时标注扫描仍能结束，以及恢复扫描时的模式冲突保护。
+同一组最终图片/视频标注通过普通下载或历史补标注后，资源关联路径、完整
+标注内容和汇总结构保持一致；原始源页和观察时间按各自采集过程如实记录。

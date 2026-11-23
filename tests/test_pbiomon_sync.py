@@ -197,6 +197,67 @@ class StateTests(unittest.TestCase):
             self.assertEqual(Path(name).read_bytes(), content)
             self.assertEqual(Path(name).stat().st_mtime_ns, mtime)
 
+    def test_full_download_and_backfill_produce_the_same_bundles_and_paths(self):
+        records = [record(species='s1'), record(species='s2'), record(kind='VIDEO')]
+        for index, value in enumerate(records):
+            populated = dict(value['finalIdentification']['attributes'][0],
+                             gender='雌性' if index != 1 else '雄性', age='成体')
+            value['finalIdentification']['attributes'] = [populated, populated.copy(),
+                                                         value['finalIdentification']['attributes'][0]]
+        identities = {(value['resourceType'], value['resourceId']) for value in records}
+        snapshots = {}
+        for mode in ('full', 'backfill'):
+            root = self.root / mode
+            store = sync.Store(root)
+            try:
+                run_id, _ = store.create_or_resume_run('2026-11-02', '2026-11-01', {})
+                task = store.next_task(run_id)
+                initial = copy.deepcopy(records)
+                if mode == 'backfill':
+                    for value in initial:
+                        del value['finalIdentification']['attributes']
+                payload = page(initial)
+                store.ingest_page(task, payload, sync.save_page(root, task, payload))
+                for kind, _ in sorted(identities):
+                    row = store.claim((kind,), 'synthetic-download')
+                    content = (kind + ' synthetic media').encode()
+                    sha = sync.hashlib.sha256(content).hexdigest()
+                    path = Path('raw/objects') / sha[:2] / (sha + '.bin')
+                    sync.atomic_bytes(root / path, content)
+                    store.completed(row, {'file_path': str(path), 'sha256': sha,
+                                          'byte_size': len(content), 'content_type': 'application/octet-stream',
+                                          'width': 100, 'height': 80, 'media': {},
+                                          'file_mtime_ns': (root / path).stat().st_mtime_ns,
+                                          'completed_at': sync.now()})
+                store.export_annotations()
+                if mode == 'backfill':
+                    with store.transaction() as db:
+                        db.execute("UPDATE runs SET status='complete' WHERE run_id=?", (run_id,))
+                    store.close()
+                    store = sync.Store(root, annotations_only=True)
+                    run_id, _ = store.create_or_resume_run('2026-11-02', '2026-11-01', {'annotations_only': True}, new_scan=True)
+                    task = store.next_task(run_id)
+                    payload = page(records)
+                    store.ingest_page(task, payload, sync.save_page(root, task, payload))
+                    store.export_annotations()
+                snapshots[mode] = {}
+                for kind, rid in identities:
+                    row = store.db.execute('SELECT annotation_path FROM resources WHERE resource_type=? AND resource_id=?', (kind, rid)).fetchone()
+                    bundle = json.loads((root / row['annotation_path']).read_text())
+                    self.assertEqual(bundle['file']['status'], 'done')
+                    provenance = bundle.pop('provenance')
+                    for source in provenance:
+                        self.assertTrue((root / source['sourcePage']).is_file())
+                    snapshots[mode][(kind, rid)] = {
+                        'annotation_path': row['annotation_path'],
+                        'bundle': bundle,
+                        'annotation_hashes': [(source['speciesId'], source['annotationHash']) for source in provenance],
+                        'provenance_keys': [sorted(source) for source in provenance],
+                    }
+            finally:
+                store.close()
+        self.assertEqual(snapshots['full'], snapshots['backfill'])
+
     def test_annotations_only_preserves_every_media_state_even_when_url_changes(self):
         states = ['done', 'pending', 'retry', 'downloading', 'failed', 'unavailable',
                   'refresh_required', 'no_url', 'not_requested', 'blocked_url', 'blocked_transport']
