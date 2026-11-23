@@ -48,6 +48,87 @@ def page(records, cursor=None):
             'pageSize': 200, 'hasMore': cursor is not None, 'nextCursor': cursor}}
 
 
+class CredentialTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.path = self.root / 'state/api-credentials.json'
+        self.path.parent.mkdir(mode=0o700)
+        self.args = SimpleNamespace(root=str(self.root), credentials_file=None)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_secret(self, value='synthetic-file-secret'):
+        self.path.write_text(json.dumps({'app_secret': value}))
+        self.path.chmod(0o600)
+
+    def test_default_restricted_file_avoids_prompt(self):
+        self.write_secret()
+        with mock.patch.dict(sync.os.environ, {}, clear=True), mock.patch.object(sync.getpass, 'getpass') as prompt:
+            self.assertEqual(sync.load_api_secret(self.args), 'synthetic-file-secret')
+            prompt.assert_not_called()
+
+    def test_environment_overrides_default_file_and_is_removed(self):
+        self.write_secret()
+        with mock.patch.dict(sync.os.environ, {'API_APP_SECRET': 'synthetic-environment-secret'}):
+            self.assertEqual(sync.load_api_secret(self.args), 'synthetic-environment-secret')
+            self.assertNotIn('API_APP_SECRET', sync.os.environ)
+
+    def test_explicit_file_overrides_environment_and_environment_is_removed(self):
+        self.write_secret()
+        self.args.credentials_file = str(self.path)
+        with mock.patch.dict(sync.os.environ, {'API_APP_SECRET': 'synthetic-environment-secret'}):
+            self.assertEqual(sync.load_api_secret(self.args), 'synthetic-file-secret')
+            self.assertNotIn('API_APP_SECRET', sync.os.environ)
+
+    def test_missing_default_file_preserves_hidden_prompt_without_saving(self):
+        with mock.patch.dict(sync.os.environ, {}, clear=True), mock.patch.object(sync.getpass, 'getpass', return_value='synthetic-prompt-secret') as prompt:
+            self.assertEqual(sync.load_api_secret(self.args), 'synthetic-prompt-secret')
+            prompt.assert_called_once()
+            self.assertFalse(self.path.exists())
+
+    def test_group_or_other_permissions_are_rejected(self):
+        self.write_secret()
+        for mode in (0o640, 0o604, 0o666):
+            with self.subTest(mode=oct(mode)):
+                self.path.chmod(mode)
+                with self.assertRaisesRegex(RuntimeError, '^credential_file_requires_owner_only_permissions$'):
+                    sync.read_credential_file(self.path)
+
+    def test_symbolic_links_and_directories_are_rejected(self):
+        self.write_secret()
+        link = self.path.with_name('linked.json')
+        link.symlink_to(self.path)
+        with self.assertRaisesRegex(RuntimeError, '^credential_file_unreadable$'):
+            sync.read_credential_file(link)
+        with self.assertRaisesRegex(RuntimeError, '^credential_file_requires_owner_only_permissions$'):
+            sync.read_credential_file(self.path.parent)
+
+    def test_wrong_owner_is_rejected(self):
+        self.write_secret()
+        info = SimpleNamespace(st_mode=self.path.stat().st_mode, st_uid=os.getuid() + 1)
+        with mock.patch.object(sync.os, 'fstat', return_value=info), self.assertRaisesRegex(RuntimeError, '^credential_file_requires_owner_only_permissions$'):
+            sync.read_credential_file(self.path)
+
+    def test_invalid_payloads_return_safe_errors_without_values(self):
+        for payload in ('invalid-json-synthetic-secret', '[]', '{}', '{"app_secret": null}', '{"app_secret": 5}', '{"app_secret": " "}'):
+            with self.subTest(payload=payload):
+                self.path.write_text(payload)
+                self.path.chmod(0o600)
+                with self.assertRaises(RuntimeError) as error:
+                    sync.read_credential_file(self.path)
+                self.assertIn(str(error.exception), ('invalid_credential_file', 'credential_file_missing_app_secret'))
+
+    def test_oversized_file_and_missing_explicit_file_do_not_fall_back(self):
+        self.write_secret('x' * 16385)
+        with self.assertRaisesRegex(RuntimeError, '^credential_file_too_large$'):
+            sync.read_credential_file(self.path)
+        self.args.credentials_file = str(self.root / 'missing.json')
+        with mock.patch.dict(sync.os.environ, {'API_APP_SECRET': 'synthetic-environment-secret'}), self.assertRaisesRegex(RuntimeError, '^credential_file_unreadable$'):
+            sync.load_api_secret(self.args)
+
+
 class StateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

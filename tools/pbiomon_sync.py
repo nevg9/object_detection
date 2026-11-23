@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Durable Pbiomon final-identification catalog and private-network asset download.
 
-The API secret is supplied through a terminal prompt or environment, never saved.
+The API secret comes from a restricted external file, environment, or prompt.
+It is never written into logs or repository files.
 This tool archives observed source annotations; it does not infer their coordinate
 system, create YOLO labels, or claim a point-in-time server snapshot.
 """
@@ -25,6 +26,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -35,7 +37,7 @@ import urllib.request
 import uuid
 import hmac
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SCHEMA_VERSION = 1
 TZ = dt.timezone(dt.timedelta(hours=8))
 QUERY_PATH = "/api/infcam/final-identifications/query"
@@ -112,6 +114,43 @@ def sha256_file(path):
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             result.update(block)
     return result.hexdigest()
+
+
+def read_credential_file(path):
+    """Read an owner-only regular file without following symlinks or logging values."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        raise RuntimeError('credential_file_unreadable') from None
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        os.close(fd)
+        raise RuntimeError('credential_file_requires_owner_only_permissions')
+    with os.fdopen(fd, 'rb') as handle:
+        raw = handle.read(16385)
+    if len(raw) > 16384:
+        raise RuntimeError('credential_file_too_large')
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise RuntimeError('invalid_credential_file') from None
+    secret = payload.get('app_secret') if isinstance(payload, dict) else None
+    if not isinstance(secret, str) or not secret.strip():
+        raise RuntimeError('credential_file_missing_app_secret')
+    return secret
+
+
+def load_api_secret(args):
+    # Remove inherited secrets before spawning any child process.
+    environment_secret = os.environ.pop('API_APP_SECRET', None)
+    if args.credentials_file:
+        return read_credential_file(args.credentials_file)
+    if environment_secret:
+        return environment_secret
+    default = Path(args.root) / 'state/api-credentials.json'
+    if default.exists() or default.is_symlink():
+        return read_credential_file(default)
+    return getpass.getpass('API app secret (hidden; memory only): ')
 
 
 def atomic_bytes(path, data):
@@ -1021,7 +1060,7 @@ def run_command(args):
         raise RuntimeError('no_completed_history_watermark_for_incremental')
     if args.start_date and args.start_date > args.end_date:
         raise RuntimeError('incremental_start_is_after_end_date')
-    secret = os.environ.pop('API_APP_SECRET', None) or getpass.getpass('API app secret (hidden; memory only): ')
+    secret = load_api_secret(args)
     ready_fd = None
     if args.detach:
         read_fd, write_fd = os.pipe()
@@ -1129,6 +1168,7 @@ def main():
     run.add_argument('--root', default=DEFAULT_ROOT)
     run.add_argument('--api-base', default='https://open.pbiomon.cn')
     run.add_argument('--app-id', default=os.environ.get('API_APP_ID', 'ai_p_20261102'))
+    run.add_argument('--credentials-file', help='owner-only JSON file containing app_secret; defaults to ROOT/state/api-credentials.json when present')
     run.add_argument('--end-date', default=dt.datetime.now(TZ).date().isoformat())
     run.add_argument('--start-date')
     run.add_argument('--mode', choices=['auto', 'history', 'incremental'], default='auto')
