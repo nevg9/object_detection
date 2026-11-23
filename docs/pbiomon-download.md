@@ -3,6 +3,10 @@
 部署目标：`image0_processing`，数据根目录 `/mnt/data2/pbiomon_yolo`。
 本工具归档原始数据，不转换未知坐标、不导出 YOLO 标签、不启动训练。
 本轮用户指定截止日期为 **2026-11-01（含当天，北京时间，最终鉴定首次完成日期）**。
+以下完整标注约定依据用户提供的 v1.4.0 `openapi.yaml` 与 `接口文档.md`。
+其中 OpenAPI 的 `info.version` 为 1.4.0，Markdown 文档页首仍写 1.3.0；
+本次按两份文档均已定义的 `finalIdentification.attributes[]` 说明实现，
+不将文档示例中的性别、年龄等演示值视为线上真实标注。
 
 代码主干为 `main`，本地和服务器均跟踪 `origin/main`。服务器 Git 工作副本为
 `/mnt/data2/pbiomon_yolo/code/repository`；`bin/` 中正式入口指向该工作副本的工具文件。
@@ -15,6 +19,8 @@
 - API：`https://open.pbiomon.cn/api/infcam/final-identifications/query`。
 - 每页 200 条，不按物种或 AI 一致性裁剪（`aiConsistency=-1`）。
 - 默认同时下载 `PHOTO` 和 `VIDEO`，4 个工作线程，其中一个优先处理视频。
+- **默认保存接口返回的全部标注信息**，不需要另加性别、年龄等字段开关。
+  `--include` 控制媒体下载类型，查询到的所有物种标注仍完整归档。
 - 资源下载只允许 HTTPS `resource.pbiomon.cn:443`，curl 强制
   `--resolve resource.pbiomon.cn:443:10.249.0.110 --noproxy '*'`。
 - 保持原 URL 的 Host/SNI 和证书校验；不跟随重定向，不回退公网。
@@ -23,6 +29,37 @@
   不写入代码、参数、日志、配置或状态文件。退出后恢复任务需要重新输入。
 - 原始 API 页和 SQLite 包含资源下载地址，属于内部数据；不要把这些原始
   内容直接粘贴到公开日志。`status`、事件日志和下载回执不输出下载地址。
+
+## 完整标注字段（v1.4.0）
+
+每条“资源 × 物种”记录完整保存 `finalIdentification` 和 `ai`，包括鉴定 ID、
+首次完成时间、鉴定人、全部属性、备注、全部框及视频帧信息、AI 物种和一致性。
+不按字段白名单裁剪这两个对象；未来新增的嵌套字段也原样保留。
+原始响应在 `raw/pages/`，资源元信息和物种明细保存在 SQLite；
+逐资源汇总在 `raw/annotations/{PHOTO或VIDEO}/{资源key前2位}/{资源key}/current.json`。
+
+性别、年龄等字段的汇总 JSON 路径为
+`annotations[].finalIdentification.attributes[]`，每项包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `gender` | 性别 |
+| `age` | 年龄 |
+| `postureBehavior` | 姿势行为 |
+| `generalBehavior` | 一般行为 |
+| `breedingBehavior` | 繁殖行为 |
+| `groupingBehavior` | 聚群行为 |
+| `photoQuality` | 照片质量 |
+
+图片和视频都保存这些字段。`attributes[]` 按原鉴定项顺序完整保存，不合并、
+不去重、不截断；多项、重复项、七项全为 `null` 的项均保留。
+属性属于当前资源中的当前物种，文档没有提供属性项与某个框、某帧或某个动物
+个体的一对一关联，不能自行按数组下标配对；属性项数和 `boxCount` 都不能
+直接当作个体数。
+
+旧版响应缺少 `attributes` 与新版返回全空属性是不同情况。缺失字段不伪造，
+`null` 不猜测、不用空字符串代替。只有线上接口实际返回的属性才能补全，
+所有字段都有保存也不意味着每个字段都有非空业务值。
 
 ## 状态与完整性
 
@@ -39,7 +76,7 @@
 - 图片默认上限 256 MiB，视频默认上限 16 GiB，可用命令参数调整。
   超限或无法校验的资源保留明确失败状态，不计作完成。
 - 数据盘剩余低于 100 GiB 时暂停文件下载并保留任务，不自动删除数据。
-- `raw/annotations/.../current.json` 汇总目前观察到的物种和最终框；同目录
+- `raw/annotations/.../current.json` 汇总目前观察到的物种、全部鉴定属性及最终框；同目录
   保留生成过的内容版本。原始 API 页保留每次抓到的原始响应。
 - 当前 API 没有快照及变更游标。汇总只代表已观察记录，不承诺平台某时刻的
   全量快照；不能仅因某次未出现某物种就自动删除本地历史标注。
@@ -100,6 +137,49 @@ python3 /mnt/data2/pbiomon_yolo/bin/pbiomon_audit.py --root /mnt/data2/pbiomon_y
 
 命令在服务器上执行。代码位于数据根目录的 `bin/pbiomon_sync.py`。
 
+### 已下载媒体只补标注
+
+沿用 `/mnt/data2/pbiomon_yolo` 的原 SQLite 台账；新建空目录无法复用原媒体关联。
+首次补全本轮历史范围执行：
+
+```bash
+python3 /mnt/data2/pbiomon_yolo/bin/pbiomon_sync.py run \
+  --root /mnt/data2/pbiomon_yolo \
+  --mode history --end-date 2026-11-01 --new-scan \
+  --annotations-only --detach
+```
+
+这里保留原截止日，且不指定开始日，重查截至 2026-11-01 的全部历史鉴定。
+接口按**首次鉴定完成时间**筛选，没有属性修改时间或按资源 ID 批量查询接口；
+只查 2026-11-02 之后、使用默认 7 天重叠窗口，或者接着旧扫描的末尾游标，
+都不能补齐更早记录中本次新增的属性。若历史归档范围已扩大，使用实际需要
+回查的截止日，不把上面日期改成属性修改日期。
+
+本模式只请求鉴定 API、更新原始页与标注台账并输出 JSON：
+
+- 按 `(resourceType, resourceId, speciesId)` 更新当前标注，已有版本保留；
+  重跑不会将相同属性反复追加进数组。
+- 保持已有媒体文件、下载回执、路径、SHA256、完成时间和队列状态。
+  不启动媒体下载线程，不做媒体修复/重新校验，也不因链接变化重试 404。
+- 范围内新发现的资源同样保留其标注，媒体记为 `not_requested`，不请求媒体。
+  下次普通下载扫描重新遇到它们时，才按下载类型加入媒体队列。
+- 不能与 `--retry-failed`、`--recheck-unavailable` 或非零 `--max-downloads` 混用。
+  同一根目录仍使用全局进程锁，不能与普通下载同时运行；也不能在恢复同一个
+  未完成扫描时静默切换媒体模式。
+- 需交互输入 API 密钥，原有媒体不需要再次传输。
+
+暂停后恢复同一个标注扫描时，使用相同日期和 `--annotations-only`，去掉
+`--new-scan`；完成后确需再次回查，再加 `--new-scan` 从各分片第一页开始。
+若已有另一个未完成的目录扫描，先恢复完成它，不能强行跳过推进水位。
+
+`status` 中应看到 `annotations_only=true`、`download_workers=0`、
+`completed_downloads_this_process=0`。扫描完成且标注 JSON 全部输出后，
+`annotation_files_pending=0`；本模式的 `run.status` 只表示本次标注扫描结果，
+全局 `resources` 中以前的媒体失败或待下载项仍如实显示。
+`complete` 也不证明线上已升级为 v1.4.0 或全部属性都有值，需另行核对字段。
+
+### 常规下载（默认带全部标注）
+
 ```bash
 python3 /mnt/data2/pbiomon_yolo/bin/pbiomon_sync.py run \
   --root /mnt/data2/pbiomon_yolo \
@@ -123,6 +203,8 @@ python3 /mnt/data2/pbiomon_yolo/bin/pbiomon_sync.py run \
 默认从上次成功截止日前 6 天开始（含截止日在内重扫 7 天），补至新截止日。
 旧原图复用，物种标注仍更新。`auto` 模式优先恢复同截止日的未完成查询，
 有历史水位时按增量处理。历史查询未完成时不允许跳过它推进增量水位。
+后续普通下载持续按上面的完整字段约定保存全部标注；历史属性初次补齐后，
+更早记录的新修订仍需定期按历史范围回查，普通增量不保证覆盖这些修订。
 
 ```bash
 python3 /mnt/data2/pbiomon_yolo/bin/pbiomon_sync.py status --root /mnt/data2/pbiomon_yolo
@@ -131,6 +213,51 @@ python3 /mnt/data2/pbiomon_yolo/bin/pbiomon_sync.py stop --root /mnt/data2/pbiom
 ```
 
 `stop` 请求优雅退出，保留查询进度、回执、已完成文件和未完成任务。
+
+### 补标注验收
+
+先确认线上 API 已返回 `attributes[]`，再运行历史扫描。扫描结束后，
+对已下载媒体的标注可用以下只读检查区分“字段尚未补到”“字段全空”和“已有值”；
+不输出媒体地址或个人信息，也不读取媒体内容：
+
+```bash
+python3 - <<'PY'
+import collections
+import json
+import sqlite3
+
+fields = ('gender', 'age', 'postureBehavior', 'generalBehavior',
+          'breedingBehavior', 'groupingBehavior', 'photoQuality')
+db = sqlite3.connect('file:/mnt/data2/pbiomon_yolo/state/state.sqlite?mode=ro', uri=True)
+counts = collections.Counter()
+for (raw,) in db.execute('''
+    SELECT a.annotation_json FROM annotations a
+    JOIN resources r USING(resource_type, resource_id) WHERE r.status='done'
+'''):
+    counts['downloaded_media_species_records'] += 1
+    final = json.loads(raw)['finalIdentification']
+    if 'attributes' not in final:
+        counts['missing_attributes_field'] += 1
+        continue
+    items = final['attributes']
+    if (not isinstance(items, list) or not items or
+        any(not isinstance(item, dict) or any(key not in item or
+            (item[key] is not None and (not isinstance(item[key], str) or not item[key].strip()))
+            for key in fields) for item in items)):
+        counts['invalid_attributes_structure'] += 1
+        continue
+    counts['records_with_attributes'] += 1
+    has_value = any(item[key] is not None for item in items for key in fields)
+    counts['records_with_values' if has_value else 'records_all_attributes_null'] += 1
+db.close()
+print(json.dumps(dict(counts), ensure_ascii=False, indent=2))
+PY
+```
+
+输出计数的单位是“资源 × 物种”记录，不是文件数；未出现的计数项视为 0。
+若仍有缺失，核对原始响应与扫描范围：线上未返回、历史记录已被撤销或不再
+返回等情况不能在本地推测补齐。全空属性合法，不能为了验收而填造性别或年龄。
+本次功能测试使用临时数据；部署源码和测试通过不代表生产历史标注已补完。
 
 ## 验证
 
@@ -141,3 +268,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_pbiomon_
 测试只使用临时目录和构造记录，覆盖跨页归并、并发领取、事务回滚、回执恢复、
 已完成文件复用、原始坐标保留以及内网路由约束。线上小范围试运行和正式下载
 结果保存在服务器 `reports/`。不运行仓库现有会修改或删除数据的清理脚本。
+新增检查覆盖 v1.4 多项/重复/全空属性、旧记录原位补字段、图片和视频文件及
+回执不变、所有已有媒体队列状态不变、只补标注模式无媒体下载器或工作线程、
+有旧媒体积压时标注扫描仍能结束，以及恢复扫描时的模式冲突保护。

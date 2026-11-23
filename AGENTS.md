@@ -2,6 +2,12 @@
 
 - Python image classification, object detection, data processing, and Flask utilities live in `image_classifier/`, `object_detection/`, `process_data/`, and `flask_web/`. The root `README.md` identifies Ultralytics as a dependency.
 
+# Pbiomon annotation policy
+
+- Image and video downloads must archive all annotation information returned by the API by default: full `finalIdentification` (including every `attributes[]` item, remarks, boxes, and identification metadata), full `ai`, and resource metadata. Preserve raw responses and unknown nested fields; do not silently reduce annotations to species and boxes.
+- The v1.4.0 attribute fields are `gender`, `age`, `postureBehavior`, `generalBehavior`, `breedingBehavior`, `groupingBehavior`, and `photoQuality`. Preserve item order, duplicates, and null values. Do not infer a one-to-one mapping between attributes and boxes or animal individuals.
+- For annotation backfills, use the existing archive root and ledger with `--annotations-only`. Preserve existing media files, receipts, hashes, and media queue states. Historical attribute updates require rescanning the original identification-date range; the normal overlap window cannot cover arbitrary old edits. See `docs/pbiomon-download.md` for commands and acceptance checks.
+
 # Validation boundaries
 
 - No unified test command is currently documented in the root `README.md`. Select checks for the affected component; a filename containing `test` does not establish that it is a test suite.

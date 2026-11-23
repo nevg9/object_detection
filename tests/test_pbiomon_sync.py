@@ -1,13 +1,16 @@
 """Behavior checks use disposable files and synthetic source records only."""
 import concurrent.futures
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -27,6 +30,8 @@ def record(rid='A', species='s1', kind='PHOTO', url=None):
         'finalIdentification': {
             'id': 'final-' + species, 'identifiedAt': '2026-11-01 12:00:00',
             'identifierId': None, 'identifierName': None, 'remarks': [],
+            'attributes': [{key: None for key in ('gender', 'age', 'postureBehavior',
+                           'generalBehavior', 'breedingBehavior', 'groupingBehavior', 'photoQuality')}],
             'boxCount': 1, 'boxesComplete': False,
             'boxes': [{'left': 10, 'top': 20, 'width': 30, 'height': 40,
                        'isAI': None, 'frameId': None if kind == 'PHOTO' else 1,
@@ -139,6 +144,87 @@ class StateTests(unittest.TestCase):
         versions = [x for x in current.parent.glob('*.json') if x.name != 'current.json']
         self.assertEqual(len(versions), 2)
         self.assertEqual(json.loads(current.read_text())['annotations'][0]['finalIdentification']['boxes'][0]['left'], 11)
+
+    def test_default_download_keeps_all_annotation_attributes_and_unknown_fields(self):
+        records = [record(kind=kind) for kind in ('PHOTO', 'VIDEO')]
+        for value in records:
+            populated = dict(value['finalIdentification']['attributes'][0], gender='雌性', age='成体', generalBehavior='觅食')
+            value['finalIdentification']['attributes'] = [populated, populated.copy(), value['finalIdentification']['attributes'][0]]
+            value['finalIdentification']['futureField'] = {'nested': [None, 'unchanged']}
+            value['ai']['futureField'] = True
+        self.ingest(records)
+        self.store.export_annotations()
+        for value in records:
+            with self.subTest(kind=value['resourceType']):
+                row = self.resource(kind=value['resourceType'])
+                self.assertEqual(row['status'], 'pending')
+                saved = json.loads((self.root / row['annotation_path']).read_text())['annotations'][0]
+                self.assertEqual(saved['finalIdentification'], value['finalIdentification'])
+                self.assertEqual(saved['ai'], value['ai'])
+
+    def test_legacy_done_media_gets_new_attributes_without_file_or_receipt_changes(self):
+        legacy = [record(kind=kind) for kind in ('PHOTO', 'VIDEO')]
+        for value in legacy:
+            del value['finalIdentification']['attributes']
+        self.ingest(legacy, 'next-page')
+        for kind in ('PHOTO', 'VIDEO'):
+            row = self.store.claim((kind,), 'seed')
+            receipt = self.receipt(row)
+            self.store.completed(row, receipt)
+            sync.atomic_json(self.root / 'raw/receipts' / (kind + '.json'), receipt)
+        self.store.export_annotations()
+        before = {kind: self.resource(kind=kind) for kind in ('PHOTO', 'VIDEO')}
+        original_files = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+                          for base in ('raw/objects', 'raw/receipts') for path in (self.root / base).rglob('*') if path.is_file()}
+        self.store.close()
+        self.store = sync.Store(self.root, annotations_only=True)
+        updated = [record(kind=kind) for kind in ('PHOTO', 'VIDEO')]
+        for value in updated:
+            value['finalIdentification']['attributes'][0].update(gender='雄性', age='幼体')
+            value['downloadUrl'] = 'https://resource.pbiomon.cn/new-link'
+        self.ingest(updated)
+        self.store.export_annotations()
+        for value in updated:
+            kind = value['resourceType']
+            after = self.resource(kind=kind)
+            for field in ('status', 'file_path', 'sha256', 'byte_size', 'file_mtime_ns', 'completed_at'):
+                self.assertEqual(after[field], before[kind][field])
+            current = self.root / after['annotation_path']
+            self.assertEqual(json.loads(current.read_text())['annotations'][0]['finalIdentification'], value['finalIdentification'])
+            versions = [path for path in current.parent.glob('*.json') if path.name != 'current.json']
+            self.assertTrue(any('attributes' not in json.loads(path.read_text())['annotations'][0]['finalIdentification'] for path in versions))
+        for name, (content, mtime) in original_files.items():
+            self.assertEqual(Path(name).read_bytes(), content)
+            self.assertEqual(Path(name).stat().st_mtime_ns, mtime)
+
+    def test_annotations_only_preserves_every_media_state_even_when_url_changes(self):
+        states = ['done', 'pending', 'retry', 'downloading', 'failed', 'unavailable',
+                  'refresh_required', 'no_url', 'not_requested', 'blocked_url', 'blocked_transport']
+        self.ingest([record(rid=state) for state in states], 'next-page')
+        with self.store.transaction() as db:
+            for state in states:
+                db.execute('UPDATE resources SET status=?,attempts=3,retry_after=123,owner=?,last_error=? WHERE resource_id=?',
+                           (state, 'prior-owner', 'prior-error', state))
+        fields = ('status', 'attempts', 'retry_after', 'owner', 'last_error')
+        before = {state: tuple(self.resource(rid=state)[key] for key in fields) for state in states}
+        self.store.close()
+        self.store = sync.Store(self.root, annotations_only=True)
+        self.ingest([record(rid=state, url='https://resource.pbiomon.cn/refreshed') for state in states] + [record(rid='new')])
+        for state in states:
+            self.assertEqual(tuple(self.resource(rid=state)[key] for key in fields), before[state])
+        self.assertEqual(self.resource(rid='new')['status'], 'not_requested')
+        self.assertIsNone(self.store.claim(('PHOTO', 'VIDEO'), 'must-not-download'))
+
+    def test_resume_cannot_silently_switch_between_media_and_annotation_only(self):
+        with self.assertRaisesRegex(RuntimeError, 'unfinished_run_has_different_media_mode'):
+            self.store.create_or_resume_run('2026-11-02', '2026-11-01', {'annotations_only': True})
+        with self.store.transaction() as db:
+            db.execute('UPDATE runs SET config_json=? WHERE run_id=?', (sync.canonical({'annotations_only': True}), self.run))
+        with self.assertRaisesRegex(RuntimeError, 'unfinished_run_has_different_media_mode'):
+            self.store.create_or_resume_run('2026-11-02', '2026-11-01', {})
+        run_id, resumed = self.store.create_or_resume_run('2026-11-02', '2026-11-01', {'annotations_only': True})
+        self.assertTrue(resumed)
+        self.assertEqual(run_id, self.run)
 
     def test_crash_after_receipt_recovers_without_network(self):
         self.ingest([record()])
@@ -387,6 +473,88 @@ class RetryPolicyTests(unittest.TestCase):
         self.assertEqual(sync.retry_after_seconds('Thu, 01 Jan 1970 00:02:00 GMT', reference_time=0),120)
         self.assertIsNone(sync.retry_after_seconds('not-a-date'))
         self.assertIsNone(sync.retry_after_seconds('-1'))
+
+
+class AnnotationOnlyRunnerTests(unittest.TestCase):
+    def test_annotations_only_cli_needs_no_media_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(mock.patch.object(sync.sys, 'argv', [
+                'pbiomon_sync.py', 'run', '--root', directory, '--mode', 'history',
+                '--start-date', '2026-11-01', '--end-date', '2026-11-01', '--annotations-only']))
+            stack.enter_context(mock.patch.dict(sync.os.environ, {'API_APP_SECRET': 'synthetic-secret'}))
+            stack.enter_context(mock.patch.object(sync.Api, 'query', return_value=page([record(), record(kind='VIDEO')])))
+            stack.enter_context(mock.patch.object(sync.shutil, 'which', side_effect=AssertionError('media dependency checked')))
+            stack.enter_context(mock.patch.object(sync, 'Downloader', side_effect=AssertionError('media downloader constructed')))
+            stack.enter_context(mock.patch.object(sync.signal, 'signal'))
+            self.assertEqual(sync.main(), 0)
+            status = json.loads((Path(directory) / 'reports/status.json').read_text())
+            self.assertTrue(status['annotations_only'])
+            self.assertEqual(status['run']['status'], 'complete')
+            self.assertEqual(status['annotation_records'], 2)
+            self.assertEqual(status['resources'], [
+                {'type': 'PHOTO', 'status': 'not_requested', 'count': 1, 'bytes': 0},
+                {'type': 'VIDEO', 'status': 'not_requested', 'count': 1, 'bytes': 0}])
+
+    def test_refresh_finishes_with_old_media_backlog_and_never_starts_media_work(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            store = sync.Store(root)
+            try:
+                run_id, _ = store.create_or_resume_run('2026-11-01', '2026-11-01', {})
+                task = store.next_task(run_id)
+                old = [record(rid=state, kind='VIDEO') for state in ('pending', 'retry', 'downloading', 'unavailable', 'done')]
+                payload = page(old)
+                store.ingest_page(task, payload, sync.save_page(root, task, payload))
+                with store.transaction() as db:
+                    for value in old:
+                        db.execute('UPDATE resources SET status=? WHERE resource_id=?', (value['resourceId'], value['resourceId']))
+                    db.execute("UPDATE runs SET status='complete' WHERE run_id=?", (run_id,))
+            finally:
+                store.close()
+            args = SimpleNamespace(root=directory, include=['PHOTO', 'VIDEO'], annotations_only=True,
+                                   api_base='https://example.invalid', app_id='synthetic', api_interval=6.5,
+                                   private_ip='10.249.0.110', reserve_gib=100, workers=4,
+                                   start_date='2026-11-01', end_date='2026-11-01', new_scan=True,
+                                   overlap_days=7, retry_failed=False, recheck_unavailable=False,
+                                   split_pages=1000, report_interval=30, max_downloads=0, max_seconds=5)
+            updated = [record(rid=value['resourceId'], kind='VIDEO', url='https://resource.pbiomon.cn/refreshed') for value in old]
+            for value in updated:
+                value['finalIdentification']['attributes'][0].update(gender='雌性', age='成体')
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(sync, 'Downloader', side_effect=AssertionError('media downloader constructed')))
+                for method in ('recover_claims', 'settle_held_failures', 'reconcile_completed', 'retry_failed', 'recheck_unavailable', 'claim'):
+                    stack.enter_context(mock.patch.object(sync.Store, method, side_effect=AssertionError('media queue touched')))
+                query = stack.enter_context(mock.patch.object(sync.Api, 'query', side_effect=[page(updated[:2], 'next'), page(updated[2:] + [record(rid='new')])]))
+                worker = stack.enter_context(mock.patch.object(sync.Runner, 'worker'))
+                runner = sync.Runner(args, 'synthetic-secret')
+                try:
+                    self.assertEqual(runner.run(), 0)
+                    summary = runner.store.summary(runner.run_id)
+                    self.assertEqual(summary['run']['status'], 'complete')
+                    self.assertEqual(summary['annotation_files_pending'], 0)
+                    self.assertEqual(query.call_count, 2)
+                    self.assertEqual(query.call_args_list[1].args[0]['cursor'], 'next')
+                    worker.assert_not_called()
+                    for value in old:
+                        row = runner.store.db.execute('SELECT * FROM resources WHERE resource_id=?', (value['resourceId'],)).fetchone()
+                        self.assertEqual(row['status'], value['resourceId'])
+                        saved = json.loads((root / row['annotation_path']).read_text())
+                        self.assertEqual(saved['annotations'][0]['finalIdentification']['attributes'][0]['gender'], '雌性')
+                    status = json.loads((root / 'reports/status.json').read_text())
+                    self.assertTrue(status['annotations_only'])
+                    self.assertEqual(status['download_workers'], 0)
+                    self.assertEqual(status['completed_downloads_this_process'], 0)
+                    self.assertFalse(status['disk_downloads_paused'])
+                finally:
+                    runner.store.close()
+
+    def test_conflicting_download_options_are_rejected_before_secret_prompt(self):
+        for option in ('--retry-failed', '--recheck-unavailable', '--max-downloads=1'):
+            with self.subTest(option=option), mock.patch.object(sync.sys, 'argv', ['pbiomon_sync.py', 'run', '--annotations-only', option]), \
+                    mock.patch.object(sync.getpass, 'getpass') as prompt, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(sync.main(), 1)
+                prompt.assert_not_called()
 
 
 class AssociationAuditTests(unittest.TestCase):

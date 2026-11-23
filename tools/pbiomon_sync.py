@@ -35,7 +35,7 @@ import urllib.request
 import uuid
 import hmac
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SCHEMA_VERSION = 1
 TZ = dt.timezone(dt.timedelta(hours=8))
 QUERY_PATH = "/api/infcam/final-identifications/query"
@@ -191,9 +191,10 @@ class Log:
 
 
 class Store:
-    def __init__(self, root, include=("PHOTO", "VIDEO")):
+    def __init__(self, root, include=("PHOTO", "VIDEO"), annotations_only=False):
         self.root = Path(root)
         self.include = set(include)
+        self.annotations_only = annotations_only
         for name in ("state", "raw/pages", "raw/objects", "raw/annotations", "raw/receipts", "raw/partial", "reports"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -270,6 +271,8 @@ class Store:
             if existing and not new_scan:
                 if existing['end_date'] != end_date or existing['start_date'] != start_date:
                     raise RuntimeError("unfinished_run_has_different_date_range")
+                if bool(json.loads(existing['config_json']).get('annotations_only', False)) != bool(config.get('annotations_only', False)):
+                    raise RuntimeError("unfinished_run_has_different_media_mode")
                 db.execute("UPDATE runs SET status='running',finished_at=NULL WHERE run_id=?", (existing['run_id'],))
                 db.execute("UPDATE tasks SET status='pending' WHERE run_id=? AND status='running'", (existing['run_id'],))
                 return existing['run_id'], True
@@ -358,11 +361,15 @@ class Store:
         metadata = {k: v for k, v in record.items() if k not in ('speciesId', 'speciesName', 'finalIdentification', 'ai', 'downloadUrl')}
         url = record.get('downloadUrl')
         desired = 'pending' if kind in self.include and url else ('no_url' if kind in self.include else 'not_requested')
+        if self.annotations_only:
+            desired = 'not_requested'
         prior = db.execute("SELECT download_url,status,metadata_json FROM resources WHERE resource_type=? AND resource_id=?", (kind, rid)).fetchone()
         db.execute("INSERT OR IGNORE INTO resources(resource_type,resource_id,resource_key,metadata_json,download_url,status,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?)", (kind, rid, resource_key(kind, rid), canonical(metadata), url, desired, stamp, stamp))
         if prior:
             status = prior['status']
-            if status == 'not_requested' and kind in self.include:
+            if self.annotations_only:
+                pass  # Refresh metadata without changing any existing media queue state.
+            elif status == 'not_requested' and kind in self.include:
                 status = desired
             elif status == 'no_url' and url:
                 status = 'pending'
@@ -373,6 +380,7 @@ class Store:
                 db.execute("UPDATE resources SET annotation_revision=annotation_revision+1,annotation_dirty=1 WHERE resource_type=? AND resource_id=?", (kind, rid))
             if status == 'pending' and status != prior['status']:
                 db.execute("UPDATE resources SET attempts=0,retry_after=0,last_error=NULL WHERE resource_type=? AND resource_id=?", (kind, rid))
+        # Preserve complete payloads, including v1.4 attributes and future nested fields.
         annotation = {'speciesId': species, 'speciesName': record['speciesName'], 'finalIdentification': final, 'ai': record['ai']}
         hashed = digest(annotation)
         previous = db.execute("SELECT annotation_hash FROM annotations WHERE resource_type=? AND resource_id=? AND species_id=?", (kind, rid, species)).fetchone()
@@ -437,6 +445,8 @@ class Store:
             return db.execute("UPDATE resources SET status='pending',attempts=0,retry_after=0,last_error=NULL,annotation_revision=annotation_revision+1,annotation_dirty=1 WHERE status='unavailable' AND download_url IS NOT NULL").rowcount
 
     def claim(self, preferred, owner):
+        if self.annotations_only:
+            return None
         with self.transaction() as db:
             # Reserve at most one preferred slot per nine fresh jobs for due
             # transient retries. If no fresh work exists, retries drain normally.
@@ -771,9 +781,9 @@ class Runner:
         self.catalog_done = threading.Event()
         self.failure = None
         self.log = Log(self.root / 'reports/events.jsonl')
-        self.store = Store(self.root, args.include)
+        self.store = Store(self.root, args.include, annotations_only=args.annotations_only)
         self.api = Api(args.api_base, args.app_id, secret, args.api_interval, self.stop, self.log)
-        self.downloader = Downloader(self.store, args.private_ip, args.reserve_gib, self.stop, self.log, args.max_photo_mib, args.max_video_gib)
+        self.downloader = None if args.annotations_only else Downloader(self.store, args.private_ip, args.reserve_gib, self.stop, self.log, args.max_photo_mib, args.max_video_gib)
         self.run_id = None
         self.started_downloads = 0
         self.completed_downloads = 0
@@ -877,7 +887,7 @@ class Runner:
 
     def write_summary(self):
         summary = self.store.summary(self.run_id)
-        summary.update({'pid': os.getpid(), 'private_resource_ip': self.args.private_ip, 'download_workers': self.args.workers, 'elapsed_seconds_this_process': round(time.monotonic() - self.start_time, 1), 'completed_downloads_this_process': self.completed_downloads, 'fatal_error': self.failure, 'disk_downloads_paused': shutil.disk_usage(self.root).free < self.downloader.reserve, 'code_version': VERSION, 'code_sha256': self.code_sha256})
+        summary.update({'pid': os.getpid(), 'private_resource_ip': self.args.private_ip, 'annotations_only': self.args.annotations_only, 'download_workers': 0 if self.args.annotations_only else self.args.workers, 'elapsed_seconds_this_process': round(time.monotonic() - self.start_time, 1), 'completed_downloads_this_process': self.completed_downloads, 'fatal_error': self.failure, 'disk_downloads_paused': self.downloader is not None and shutil.disk_usage(self.root).free < self.downloader.reserve, 'code_version': VERSION, 'code_sha256': self.code_sha256})
         atomic_json(self.root / 'reports/status.json', summary)
         return summary
 
@@ -896,26 +906,31 @@ class Runner:
             'nextRunMode': 'incremental_after_completed_catalog',
             'overlapDays': self.args.overlap_days,
             'resourceTypes': self.args.include,
+            'annotationsOnly': self.args.annotations_only,
+            'annotationPayloadPolicy': 'preserve_full_finalIdentification_and_ai',
             'resourceHost': RESOURCE_HOST,
             'privateResourceIp': self.args.private_ip,
             'sourceSnapshotGuaranteed': False,
             'retryPolicyVersion': 2,
             'notFoundPolicy': 'hold_until_url_changes_or_explicit_recheck',
         })
-        recovered = self.store.recover_claims()
-        settled = self.store.settle_held_failures()
-        damaged = self.store.reconcile_completed()
-        retried = self.store.retry_failed() if self.args.retry_failed else 0
-        rechecked = self.store.recheck_unavailable() if self.args.recheck_unavailable else 0
+        recovered = damaged = retried = rechecked = 0
+        settled = {}
+        if not self.args.annotations_only:
+            recovered = self.store.recover_claims()
+            settled = self.store.settle_held_failures()
+            damaged = self.store.reconcile_completed()
+            retried = self.store.retry_failed() if self.args.retry_failed else 0
+            rechecked = self.store.recheck_unavailable() if self.args.recheck_unavailable else 0
         atomic_json(self.root / 'state/process.json', {'pid': os.getpid(), 'run_id': self.run_id, 'started_at': now(), 'hostname': socket.gethostname()})
-        self.log('run_started', run_id=self.run_id, resumed=resumed, recovered_claims=recovered, settled_held_failures=settled, unavailable_explicitly_rechecked=rechecked, files_needing_repair=damaged, failed_tasks_retried=retried, include=self.args.include, private_ip=self.args.private_ip)
+        self.log('run_started', run_id=self.run_id, resumed=resumed, annotations_only=self.args.annotations_only, recovered_claims=recovered, settled_held_failures=settled, unavailable_explicitly_rechecked=rechecked, files_needing_repair=damaged, failed_tasks_retried=retried, include=self.args.include, private_ip=self.args.private_ip)
         self.write_summary()
         if ready_fd is not None:
             os.write(ready_fd, (canonical({'pid': os.getpid(), 'run_id': self.run_id, 'root': str(self.root)}) + '\n').encode())
             os.close(ready_fd)
         collector = threading.Thread(target=self.collector, name='collector', daemon=True)
         collector.start()
-        workers = [threading.Thread(target=self.worker, args=(n,), name='download-{}'.format(n), daemon=True) for n in range(self.args.workers)]
+        workers = [threading.Thread(target=self.worker, args=(n,), name='download-{}'.format(n), daemon=True) for n in range(0 if self.args.annotations_only else self.args.workers)]
         for worker in workers:
             worker.start()
         report_at = 0
@@ -949,8 +964,8 @@ class Runner:
                     status = 'paused'
                 else:
                     counts = dict(db.execute("SELECT status,COUNT(*) FROM tasks WHERE run_id=? GROUP BY status", (self.run_id,)))
-                    pending = db.execute("SELECT COUNT(*) FROM resources WHERE status IN ('pending','retry','downloading')").fetchone()[0]
-                    failed = db.execute("SELECT COUNT(*) FROM resources WHERE status IN ({})".format(','.join('?' for _ in HELD_STATUSES)), HELD_STATUSES).fetchone()[0]
+                    pending = 0 if self.args.annotations_only else db.execute("SELECT COUNT(*) FROM resources WHERE status IN ('pending','retry','downloading')").fetchone()[0]
+                    failed = 0 if self.args.annotations_only else db.execute("SELECT COUNT(*) FROM resources WHERE status IN ({})".format(','.join('?' for _ in HELD_STATUSES)), HELD_STATUSES).fetchone()[0]
                     status = 'paused' if pending or counts.get('pending') or counts.get('running') else ('completed_with_errors' if failed or counts.get('error') else 'complete')
                 db.execute("UPDATE runs SET status=?,finished_at=? WHERE run_id=?", (status, now(), self.run_id))
             summary = self.write_summary()
@@ -971,14 +986,17 @@ def lock_process(root):
 
 
 def run_command(args):
-    if not ipaddress.ip_address(args.private_ip).is_private:
-        raise RuntimeError('resource_ip_must_be_private')
+    if args.annotations_only and (args.retry_failed or args.recheck_unavailable or args.max_downloads):
+        raise RuntimeError('annotations_only_conflicts_with_download_options')
     if args.workers < 1 or args.api_interval < 6.1 or args.reserve_gib < 1 or args.overlap_days < 1:
         raise RuntimeError('invalid_worker_rate_or_disk_configuration')
-    if not shutil.which('curl'):
-        raise RuntimeError('curl_required')
-    if 'PHOTO' in args.include:
-        import PIL  # noqa: F401
+    if not args.annotations_only:
+        if not ipaddress.ip_address(args.private_ip).is_private:
+            raise RuntimeError('resource_ip_must_be_private')
+        if not shutil.which('curl'):
+            raise RuntimeError('curl_required')
+        if 'PHOTO' in args.include:
+            import PIL  # noqa: F401
     lock = lock_process(args.root)
     # Resolve incremental dates before asking for a credential. Reuse an
     # unfinished scan's exact range; otherwise replay a persisted overlap window.
@@ -1116,6 +1134,7 @@ def main():
     run.add_argument('--mode', choices=['auto', 'history', 'incremental'], default='auto')
     run.add_argument('--overlap-days', type=int, default=7)
     run.add_argument('--include', nargs='+', choices=['PHOTO', 'VIDEO'], default=['PHOTO', 'VIDEO'])
+    run.add_argument('--annotations-only', action='store_true', help='refresh all source annotations without downloading media or changing existing media queue states')
     run.add_argument('--private-ip', default='10.249.0.110')
     run.add_argument('--workers', type=int, default=4)
     run.add_argument('--api-interval', type=float, default=6.5)
