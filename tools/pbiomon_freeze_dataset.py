@@ -69,7 +69,56 @@ def version(path_root, review):
     return key, relative, bundle_path, source, bundle, annotations, provenance
 
 
-def reviewed_boxes(frame, annotations, class_ids, registry):
+def check_box(corners, size):
+    left, top, right, bottom = corners
+    width, height = size
+    if not (
+        all(type(value) in (int, float) for value in corners)
+        and 0 <= left < right <= width and 0 <= top < bottom <= height
+    ):
+        raise ValueError("Approved box is outside its reference image")
+    return left, top, right, bottom
+
+
+def box_pixels(raw, space, display_size, photo_geometry=None):
+    """Convert a source box using a coordinate space confirmed in its review."""
+    if space not in ("display_pixels", "raw_pixels", "raw_65536") or raw is None:
+        raise ValueError("Each box needs resolved pixels or a confirmed source coordinate space")
+    left, top, width, height = (raw.get(key) for key in ("left", "top", "width", "height"))
+    if not all(type(value) in (int, float) and math.isfinite(value) for value in (left, top, width, height)):
+        raise ValueError("Source box has missing or invalid coordinates")
+    corners = left, top, left + width, top + height
+    if space == "display_pixels":
+        return check_box(corners, display_size)
+
+    if photo_geometry is None:
+        raise ValueError("Raw-image coordinates require verified photo geometry")
+    raw_width, raw_height, orientation = photo_geometry
+    expected = (raw_height, raw_width) if orientation in (5, 6, 7, 8) else (raw_width, raw_height)
+    if tuple(display_size) != expected:
+        raise ValueError("Reviewed display dimensions disagree with the photo orientation")
+    ref_width, ref_height = (65536, 65536) if space == "raw_65536" else (raw_width, raw_height)
+    left, top, right, bottom = check_box(corners, (ref_width, ref_height))
+    x1, y1, x2, y2 = left/ref_width, top/ref_height, right/ref_width, bottom/ref_height
+    # Match the transformations applied to the pixels by ImageOps.exif_transpose.
+    oriented = {
+        0: (x1, y1, x2, y2),
+        1: (x1, y1, x2, y2),
+        2: (1-x2, y1, 1-x1, y2),
+        3: (1-x2, 1-y2, 1-x1, 1-y1),
+        4: (x1, 1-y2, x2, 1-y1),
+        5: (y1, x1, y2, x2),
+        6: (1-y2, x1, 1-y1, x2),
+        7: (1-y2, 1-x2, 1-y1, 1-x1),
+        8: (y1, 1-x2, y2, 1-x1),
+    }
+    if orientation not in oriented:
+        raise ValueError(f"Unsupported EXIF orientation: {orientation}")
+    w, h = display_size
+    return check_box(tuple(value * size for value, size in zip(oriented[orientation], (w, h, w, h))), display_size)
+
+
+def reviewed_boxes(frame, annotations, class_ids, registry, photo_geometry=None):
     if frame["complete"] is not True or not frame["boxes"]:
         raise ValueError("The review must cover all targets in the frame")
     evidence(frame["review_evidence"])
@@ -86,11 +135,13 @@ def reviewed_boxes(frame, annotations, class_ids, registry):
     seen = set()
     species_seen = set()
     labels = []
+    resolved_boxes = []
     for box in frame["boxes"]:
         species_id = box["species_id"]
         original = annotations[species_id]["finalIdentification"]
         species_seen.add(species_id)
         number = box["box_index"]
+        source_box = None
         if number is not None:
             identity = (species_id, index(number))
             if identity not in expected or identity in seen:
@@ -113,16 +164,15 @@ def reviewed_boxes(frame, annotations, class_ids, registry):
         registered_ids = registry[code].get("species_ids")
         if registered_ids and species_id not in registered_ids:
             raise ValueError("Approved species is outside the frozen class registration")
-        x1, y1, x2, y2 = box["xyxy"]
-        if not (
-            all(type(value) in (int, float) for value in (x1, y1, x2, y2))
-            and 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h
-        ):
-            raise ValueError("Approved box is outside the reviewed display image")
+        pixels = box.get("xyxy")
+        if pixels is None:
+            pixels = box_pixels(source_box, box.get("coordinate_space"), (w, h), photo_geometry)
+        x1, y1, x2, y2 = check_box(pixels, (w, h))
+        resolved_boxes.append({**box, "xyxy": (x1, y1, x2, y2)})
         labels.append((code, (x1+x2)/(2*w), (y1+y2)/(2*h), (x2-x1)/w, (y2-y1)/h))
     if seen != expected or (frame_id is None and species_seen != annotations.keys()):
         raise ValueError("Reviewed boxes do not cover the archived targets")
-    return labels
+    return labels, {**frame, "boxes": resolved_boxes}
 
 
 def video_frames(source, frames, work):
@@ -198,7 +248,11 @@ def approved_archive(args, plans, stage, registry, class_ids, photo_overlaps):
             raise ValueError(f"Empty or repeated frame approval: {key}")
         if kind == "PHOTO" and (frame_ids != [None] or frames[0]["ts_ms"] is not None):
             raise ValueError(f"Photo approval must describe a single still: {key}")
-        rows = [reviewed_boxes(frame, annotations, class_ids, registry) for frame in frames]
+        photo_geometry = None
+        if kind == "PHOTO":
+            with Image.open(source) as original:
+                photo_geometry = (*original.size, original.getexif().get(274, 1))
+        rows = [reviewed_boxes(frame, annotations, class_ids, registry, photo_geometry) for frame in frames]
         saved = stage / "metadata/source-bundles" / relative.relative_to("raw/annotations")
         saved.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(bundle_path, saved)
@@ -212,7 +266,7 @@ def approved_archive(args, plans, stage, registry, class_ids, photo_overlaps):
                 path = work / "photo.jpg"
                 training_photo(source, path, frames[0]["display_size"])
                 images, times = {None: path}, {None: None}
-            for frame, labels in zip(frames, rows):
+            for labels, frame in rows:
                 n = frame["frame_id"]
                 sample = key if n is None else f"{key}__f{n}"
                 with Image.open(images[n]) as image:

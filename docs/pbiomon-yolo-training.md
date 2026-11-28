@@ -142,7 +142,15 @@
 - 抽测的 3 个 AI 照片框和 3 个视频的 9 个非首帧框按解码画面像素落在可见目标上，视频帧时间与接口偏差最大为 0.335 ms。另有未标来源的小数坐标样例，两种画法均偏离画面中清晰可见的野猪，参考画面需进一步确认。来源空值不能作为旧标尺的唯一依据。
 - 505 对框对应的旧标签中，450 对能找到一个标准化性别年龄与旧类一致的新鉴定项，55 对没有显式一致的项。框对齐后，逐目标属性仍需单独核验。原值、抽样脚本和叠加图位于 `image0:/mnt/data2/pbiomon-training-v1/preflight/evidence/box-alignment-20261128/`。
 
+### 2026-11-28 照片框像素换算与评估候选
+
+已输出 533 个真实照片框在显示画面上的四角像素坐标。529 个同图框与旧 YOLO 标签的重合度均 ≥ 0.999，另外包括 3 个 AI 照片框和 1 个 EXIF 8 旋转样例。每条保留原值、媒体摘要、不可变标注版本、原图宽高、方向、显示宽高和换算规则。回执及坐标清单位于 `image0:/mnt/data2/pbiomon-training-v1/preflight/evidence/photo-pixels-20261128-233307/`。这一步验收几何坐标，正式标签还需核对逐框属性。 [像素换算实现](../tools/pbiomon_freeze_dataset.py)
+
+混合导出可直接采用已核准的 `xyxy`，也可从源框按照已核准的坐标类型算出 `xyxy`。隔离测试中，源像素框、旧标尺和 EXIF 方向变换都与实际解码位置一致，生成的 YOLO 数据已由固定训练环境成功加载。
+
 历史验证的 60,719 张通过标签文本筛查的阳性图中，按文件名可核对出 59,258 张与旧训练同相机同日，1,452 张缺少可核对的日期，按此口径剩 9 张候选图和 7 个相机日期组，后续还需经过内容核验。这一规模不足以支撑完整的旧类回归结论。记录位于 `image3:/mnt/data2/pbiomon-training-v1/preflight/work/legacy-regression-preview-q5_1i6a_.json`。
+
+与 A 组初始化权重相符的 `best.pt` 内嵌训练数据为 `all_species_240916.yaml`。现网对应引擎记录在 2024-11-24 导出，旧训练照片中可解析的文件名日期最晚为 2024-04-25。以 2024-11-25 为拍摄下限，并要求归档拍摄日期与文件名日期一致，新归档筛出 80 张照片和 8 个视频候选。其中 21 张照片的相机前缀在旧训练中出现过，分属 8 个相机日期组，可用于补查旧场景回归；其余按相机和站点候选分组。候选需要内容与逐框标签验收，清单位于 `image0:/mnt/data2/pbiomon-training-v1/preflight/evidence/late-capture-eval-20261128-233116/`。
 
 ### 对比结论
 
@@ -160,7 +168,11 @@ python3 tools/pbiomon_classes.py extend \
 
 在可读取两份源媒体的训练机器上导出，保留快照标注、逐类图片及框数、排除记录、逐样本摘要和旧场景／新场景测试清单。新库复核输入为 JSONL，每行对应一个资源，包含 `type`、`resource_id`、`media_sha256`、`bundle_sha256`、`split`、`group_id` 和 `frames`。统一拍摄事件或近重复组使用同一个 `group_id`，验证和测试记录提供对历史训练暴露的核对证据。与历史训练同名的照片另附内容复核证据。
 
-每个帧记录包含实际显示宽高 `display_size`、复核依据 `review_evidence` 和完整覆盖标记 `complete`。照片的 `frame_id` 和 `ts_ms` 均为 `null`。视频使用原始帧序与时间戳。每个框记录提供 `species_id`、源 `box_index`、已确认的 `attribute_index`、标准化 `species/gender/age`、以实际显示像素表示的 `xyxy`、`coordinate_evidence` 和 `association_evidence`。独立补标的框或属性将对应下标填为 `null` 并附依据。旧库回归批准清单的每行包含 `sha256` 和 `exposure_evidence`，可通过 `split` 指定验证或测试，默认测试。
+每个帧记录包含实际显示宽高 `display_size`、复核依据 `review_evidence` 和完整覆盖标记 `complete`。照片的 `frame_id` 和 `ts_ms` 均为 `null`。视频使用原始帧序与时间戳。每个框记录提供 `species_id`、源 `box_index`、已确认的 `attribute_index`、标准化 `species/gender/age`、`coordinate_evidence` 和 `association_evidence`。
+
+框坐标可提供显示像素 `xyxy`，或明确审核通过的 `coordinate_space`。照片的 `raw_65536` 和 `raw_pixels` 分别指定旧标尺和原图像素，程序依据实际照片 EXIF 同步旋转框与图。`display_pixels` 适用于已核对在显示图或解码帧上的像素坐标。导出清单记录计算结果。独立补标的框或属性将对应下标填为 `null` 并附依据。
+
+旧库回归批准清单的每行包含 `sha256` 和 `exposure_evidence`，可通过 `split` 指定验证或测试，默认测试。
 
 ```bash
 "$training_python" tools/pbiomon_freeze_dataset.py \
