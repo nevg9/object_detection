@@ -20,6 +20,7 @@ from PIL import Image, ImageOps
 
 from pbiomon_classes import AGES, GENDERS, load_registry
 from pbiomon_legacy_partitions import emit, records
+from pbiomon_stage_legacy import check_cache, image_path as cached_image, ready_image
 from pbiomon_sync import digest, resource_key
 from pbiomon_train import check_file, checksum, local_child, write_json
 
@@ -295,7 +296,10 @@ def legacy_samples(args, rows, reviewed_regression, excluded):
             continue
         split, exposure = ("train", None) if decision == "training_candidate" else reviewed_regression.pop(sha)
         original = Path(row["image"])
-        source = local_child(args.legacy_root, Path(row["historical_split"]) / "images" / original.name)
+        source = (
+            cached_image(args.legacy_media_cache, sha) if args.legacy_media_cache is not None
+            else local_child(args.legacy_root, Path(row["historical_split"]) / "images" / original.name)
+        )
         yield f"legacy_{sha}", split, "legacy", source, row["rows"], {
             "original_sha256": sha, "source_media": str(original),
             "group_id": json.dumps(row["camera_day_from_filename"]) if row["camera_day_from_filename"] else sha,
@@ -312,7 +316,8 @@ def register(groups, key, split):
         raise ValueError(f"Source content or capture group crosses held-out splits: {key}")
 
 
-def add_samples(samples, stage, manifest, excluded, counters, groups, images_seen, lists, class_count):
+def add_samples(samples, stage, manifest, excluded, counters, groups, images_seen, lists, class_count,
+                link_legacy=False):
     for key, split, origin, path, labels, metadata in samples:
         register(groups, ("original", metadata["original_sha256"]), split)
         register(groups, ("event", metadata["group_id"]), split)
@@ -339,7 +344,13 @@ def add_samples(samples, stage, manifest, excluded, counters, groups, images_see
             continue
         image_path = stage / "images" / split / (key + ".jpg")
         target = stage / "labels" / split / (key + ".txt")
-        shutil.copyfile(path, image_path)
+        link = link_legacy and origin == "legacy"
+        if link:
+            if not ready_image(path):
+                raise FileNotFoundError(f"Verified historical image is missing from the media cache: {path}")
+            os.link(path, image_path, follow_symlinks=False)
+        else:
+            shutil.copyfile(path, image_path)
         image_sha = checksum(image_path)
         if origin == "legacy" and image_sha != metadata["original_sha256"]:
             raise ValueError(f"Historical photo no longer matches its scan: {path}")
@@ -355,7 +366,8 @@ def add_samples(samples, stage, manifest, excluded, counters, groups, images_see
             continue
         images_seen[image_identity] = images_seen[source_identity] = signature
         target.write_text(label_text, encoding="ascii")
-        image_path.chmod(0o400)
+        if not link:
+            image_path.chmod(0o400)
         target.chmod(0o400)
         relative = "./" + str(image_path.relative_to(stage))
         lists[split].append(relative)
@@ -412,7 +424,8 @@ def freeze(args, stage):
     ):
         old_samples = legacy_samples(args, records(old_rows), old_approvals, excluded)
         for samples in (old_samples, new_samples):
-            add_samples(samples, stage, manifest, excluded, counters, groups, images_seen, lists, len(registry))
+            add_samples(samples, stage, manifest, excluded, counters, groups, images_seen, lists, len(registry),
+                        link_legacy=args.legacy_media_cache is not None)
     if not counters["train"]["legacy"] or not lists["test-legacy"]:
         raise ValueError("The approved historic data needs training and regression samples")
     if not (counters["train"]["archive_photo"] + counters["train"]["archive_video"]) or not lists["test-archive"]:
@@ -450,16 +463,26 @@ def freeze(args, stage):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for option in ("archive", "accepted", "legacy-root", "legacy-partitions", "legacy-test", "classes", "out"):
+    for option in ("archive", "accepted", "legacy-partitions", "legacy-test", "classes", "out"):
         parser.add_argument(f"--{option}", type=Path, required=True)
+    legacy = parser.add_mutually_exclusive_group(required=True)
+    legacy.add_argument("--legacy-root", type=Path)
+    legacy.add_argument("--legacy-media-cache", type=Path)
     args = parser.parse_args()
-    args.archive, args.legacy_root, out = args.archive.resolve(), args.legacy_root.resolve(), args.out.resolve()
-    if out == args.legacy_root or args.legacy_root in out.parents:
-        parser.error("Output must be outside the historical dataset")
+    args.archive, out = args.archive.resolve(), args.out.resolve()
+    source = (args.legacy_root or args.legacy_media_cache).resolve()
+    if args.legacy_media_cache is not None:
+        args.legacy_media_cache = check_cache(source)
+    else:
+        args.legacy_root = source
+    if out == source or source in out.parents:
+        parser.error("Output must be outside the historical dataset or media cache")
     if (out == args.archive or args.archive in out.parents) and args.archive / "exports/yolo" not in out.parents:
         parser.error("Training versions within the archive must be under exports/yolo")
     os.umask(0o077)
     out.parent.mkdir(parents=True, exist_ok=True)
+    if args.legacy_media_cache is not None and source.stat().st_dev != out.parent.stat().st_dev:
+        parser.error("The media cache and frozen dataset must be on the same filesystem")
     with (out.parent / ("." + out.name + ".lock")).open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if out.exists():

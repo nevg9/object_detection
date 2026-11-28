@@ -152,6 +152,13 @@
 
 与 A 组初始化权重相符的 `best.pt` 内嵌训练数据为 `all_species_240916.yaml`。现网对应引擎记录在 2024-11-24 导出，旧训练照片中可解析的文件名日期最晚为 2024-04-25。以 2024-11-25 为拍摄下限，并要求归档拍摄日期与文件名日期一致，新归档筛出 80 张照片和 8 个视频候选。其中 21 张照片的相机前缀在旧训练中出现过，分属 8 个相机日期组，可用于补查旧场景回归；其余按相机和站点候选分组。候选需要内容与逐框标签验收，清单位于 `image0:/mnt/data2/pbiomon-training-v1/preflight/evidence/late-capture-eval-20261128-233116/`。
 
+### 2026-11-28 跨机导入与旧图格式复核
+
+- 从 image3 向 image2 实传 12 张已经核验过字节的旧图，共 11,882,930 字节。用 TLS 1.3 先传 6 张，再按缓存缺失清单传 6 张。接收端逐文件核对 SHA256。使用当时可用的管理网链路，10G 接口地址仍有间歇性缺失。样本回执位于 `image2:/mnt/data2/pbiomon-training-v1/preflight/legacy-cache-local-link-20261128-234714/`。 [旧图库导入工具](../tools/pbiomon_stage_legacy.py)
+- image2 的隔离混合导出从受管缓存引用旧图。缓存对象和训练目录里的旧文件使用相同的 inode，旧图权限为只读。实际 YOLO 加载器读到 4 张训练图、1 张验证图和 2 张测试图。坏摘要和非法归档条目均在落盘前被拦截。缓存只保留一次照片内容。
+- 抽检原扫描隔离的 36 个空场候选，均为可完整解码的 MPO，多图文件字节与有记录的空场原图相同。用固定 Ultralytics 环境读取其中一个实际文件，取得了 640×640 输入张量。已增加仅复核图片拒绝项的入口，逐文件保留摘要与空场来源核对。另抽检了 36 张来源未核实的同名背景候选，解码像素全部有差异，仍待独立复核。 [旧图核验](../tools/pbiomon_verify_legacy.py)
+- 核对新库有媒体的 563,010 条标注记录，共 2,087,130 个框和 573,743 个鉴定项。归档框包含空间和视频帧字段，鉴定项包含业务属性，两个数组缺少可直接关联的逐目标标识。全量字段统计位于 `image0:/mnt/data2/pbiomon-training-v1/preflight/evidence/annotation-link-keys-ugatf2x9.json`。
+
 ### 对比结论
 
 三组的单机双卡接续和扩类入口已通过。正式实验等待不同来源新框的坐标单位、参考画面及方向，以及框和鉴定项的逐目标关联。收到证据后核对视频帧与标注、冻结混合集和独立测试，再执行现网基线和 A/B/C。每组记录数据版本、权重摘要、训练配置、吞吐、测试指标和实测延迟。
@@ -181,6 +188,8 @@ python3 tools/pbiomon_classes.py extend \
   --legacy-test "$accepted_legacy_eval" --classes "$candidate_classes" \
   --out "$frozen_dataset"
 ```
+
+跨机落盘时，旧库发送端用 `pbiomon_stage_legacy.py pack` 按分组回执打包，接收端用 `receive` 将流写入 `--cache`。续传时在接收端用 `missing` 取缺失摘要列表，发送端和接收端都用同一份列表作为 `--wanted`。训练机的缓存和版本目录放在同一文件系统。冻结时传 `--legacy-media-cache "$legacy_media_cache"`，导出工具校验缓存内容后引用同一份旧图。
 
 同一份实验 JSON 记录 `purpose=comparison`、`runs`、带摘要的 `dataset.receipt`、A/B/C 的初始权重路径及摘要、`runtime` 和 `training` 参数。冻结回执记录图片来源、训练／验证／测试样本量，以及 `data.yaml`、`classes.json`、`manifest.jsonl.gz` 和三份划分列表的摘要。正式使用时设置当前可用的 CUDA 设备和已验收的 Ultralytics 路径，A、B、C 分别传对应的 `--strategy`。中断后沿用相同实验文件和组别，加 `--resume`。
 

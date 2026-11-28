@@ -16,6 +16,8 @@ import time
 
 from PIL import Image, ImageOps
 
+from pbiomon_train import check_file, checksum
+
 
 def stamp():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -54,6 +56,27 @@ def image_slots(root, candidates):
             yield split, root / split / "images" / name, candidates.pop((split, name), {})
 
 
+def recheck_slots(previous, root, candidates):
+    with gzip.open(previous, "rt", encoding="utf-8") as stream:
+        for line in stream:
+            row = json.loads(line)
+            split, path = row["historical_split"], Path(row["image"])
+            if split not in ("train", "test") or path.parent != root / split / "images":
+                raise ValueError(f"Previous image outside the historical split: {path}")
+            candidate = candidates.pop((split, path.name), {})
+            yield row, (split, path, candidate) if row["status"] == "image_reject" else None
+
+
+def verify_or_reuse(item):
+    previous, slot = item
+    if slot is None:
+        return previous
+    row = verify(slot)
+    if previous and previous.get("sha256") and row.get("sha256") != previous["sha256"]:
+        raise ValueError(f"Rejected source bytes changed after verification: {row['image']}")
+    return row
+
+
 def verify(slot):
     split, path, candidate = slot
     row = {
@@ -77,13 +100,14 @@ def verify(slot):
         with Image.open(io.BytesIO(data)) as image:
             orientation = image.getexif().get(274, 1)
             width, height = image.size
-            if image.format != "JPEG" or min(width, height) < 10 or not data.endswith(b"\xff\xd9"):
-                raise ValueError("Invalid JPEG format, size or end marker")
+            if image.format not in ("JPEG", "MPO") or min(width, height) < 10 or not data.endswith(b"\xff\xd9"):
+                raise ValueError("Invalid JPEG/MPO format, size or end marker")
+            media_format = image.format
             image.draft("L", (64, 64))
             image = ImageOps.exif_transpose(image)
             thumb = image.convert("L").resize((16, 16), Image.Resampling.BOX)
         row.update(
-            dimensions=[width, height], orientation=orientation,
+            dimensions=[width, height], orientation=orientation, media_format=media_format,
             gray16=thumb.tobytes().hex(),
         )
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as error:
@@ -129,6 +153,7 @@ def main():
     parser.add_argument("--root", type=Path, required=True, help="Historical animal_action directory")
     parser.add_argument("--candidates", type=Path, required=True, help="Legacy candidate JSONL.GZ")
     parser.add_argument("--out", type=Path, required=True, help="New receipt directory")
+    parser.add_argument("--retry-rejected", type=Path, help="Completed receipt directory to recheck image rejects only")
     parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
     if args.workers < 1:
@@ -138,15 +163,28 @@ def main():
     if root == output or root in output.parents:
         parser.error("--out must be outside the source dataset")
     os.umask(0o077)
-    output.mkdir(mode=0o700, exist_ok=False)
     state = {
         "started_at": stamp(), "status": "reading_candidates",
         "root": str(root), "candidates": str(args.candidates.resolve()),
-        "candidates_sha256": hashlib.sha256(args.candidates.read_bytes()).hexdigest(),
+        "candidates_sha256": checksum(args.candidates),
     }
+    previous = None
+    previous_count = None
+    if args.retry_rejected is not None:
+        prior_receipt = args.retry_rejected / "status.json"
+        prior_state = json.loads(prior_receipt.read_bytes())
+        if (prior_state["status"] != "complete" or prior_state["root"] != str(root)
+                or prior_state["candidates_sha256"] != state["candidates_sha256"]):
+            raise ValueError("The previous scan must be complete and use the same historical inputs")
+        previous = check_file(args.retry_rejected / "images.jsonl.gz", prior_state["sha256"])
+        previous_count = prior_state["checked"]
+        state["previous_scan_receipt_sha256"] = checksum(prior_receipt)
+        state["previous_scan_content_sha256"] = prior_state["sha256"]
+    output.mkdir(mode=0o700, exist_ok=False)
     write_status(output, state)
     candidates = read_candidates(args.candidates, root)
     counts = Counter()
+    retries = Counter()
     started = time.monotonic()
     temporary = output / "images.jsonl.gz.partial"
     state["status"] = "scanning"
@@ -154,10 +192,13 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as executor, gzip.open(
         temporary, "wt", encoding="utf-8", compresslevel=1,
     ) as stream:
-        slots = image_slots(root, candidates)
+        slots = (recheck_slots(previous, root, candidates) if previous is not None
+                 else ((None, slot) for slot in image_slots(root, candidates)))
         while batch := list(itertools.islice(slots, 2048)):
-            for row in executor.map(verify, batch):
+            for (prior, slot), row in zip(batch, executor.map(verify_or_reuse, batch)):
                 counts[f"{row['historical_split']}:{row['status']}"] += 1
+                if prior is not None and slot is not None:
+                    retries[f"{row['historical_split']}:{row['status']}:{row.get('media_format', 'unreadable')}"] += 1
                 stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
             state.update(
                 checked=sum(counts.values()), counts=dict(counts), heartbeat_at=stamp(),
@@ -166,12 +207,13 @@ def main():
             write_status(output, state)
         if candidates:
             raise ValueError(f"{len(candidates)} candidate images disappeared")
-    digest = hashlib.sha256()
-    with temporary.open("rb") as stream:
-        for block in iter(lambda: stream.read(4 * 1024**2), b""):
-            digest.update(block)
+        if previous_count is not None and previous_count != sum(counts.values()):
+            raise ValueError("Retry output changed the size of the verified snapshot")
+    digest = checksum(temporary)
     temporary.replace(output / "images.jsonl.gz")
-    state.update(status="complete", finished_at=stamp(), sha256=digest.hexdigest())
+    state.update(status="complete", finished_at=stamp(), sha256=digest)
+    if previous is not None:
+        state["rechecked"] = dict(retries)
     write_status(output, state)
 
 
