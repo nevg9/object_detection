@@ -30,7 +30,7 @@
 | 新框坐标、属性关联、视频帧 | 旧源同图标尺已核对，AI 像素框和旋转样例已检查。其他参考画面及逐框属性待确认 | `review-inventory-20261128-222638/receipt.json`、`preflight/evidence/box-alignment-20261128/` |
 | 类别注册及扩类 | 已核对现网 1,167 个类别和新库物种覆盖，按原 ID 扩展 A 检测头的短测通过 | `class-coverage-review-20261128-224048/receipt.json` |
 | 混合数据冻结与数据读取短测 | 照片、视频帧、旧库和三份划分的隔离导出及加载通过，A/B/C 单机双卡接续通过，真实混合集待证据 | `freeze-fixture-20261128-225734`、`expanded-head-20261128-223841` |
-| 现网基线与 A/B/C | 待执行 | 待写入 |
+| 现网基线与 A/B/C | 独立评估入口已在 T4 完成隔离验收，正式训练和对比待执行 | `evaluation-fixture-20261129-002729/result/receipt.json` |
 
 ### 2026-11-28 初始盘点
 
@@ -184,6 +184,14 @@ image3 到 image2 的全量搬运已启动，范围为分组回执中的 580,838
 
 两台机器的任务目录均为 `/mnt/data2/pbiomon-training-v1/preflight/legacy-bulk-transfer-20261129`。image2 的 `status.json` 记录当前已验收数量、字节、每条链路已验收批次及传输用时。00:13 的实测中，万兆接口已传两批、约 1.96 GB，含逐图校验和落盘约 169 MB/s。管理口约 11.4 MB/s。image2 的万兆口还在尝试自动取地址，链路本地地址有间歇性缺失。
 
+### 2026-11-29 独立评估入口
+
+评估入口读取训练实验的封存数据回执，核对评估图片和标签的逐文件摘要，使用相同的样本、预处理与评估设置。现网基线使用 A 的初始化权重。A、B、C 使用各自已完成训练的 `best.pt` 及对应权重摘要。评估保留基线预测类别之外的新增小类真值，按漏检计入结果。 [评估工具](../tools/pbiomon_evaluate.py)
+
+输出按整体、旧库、新库、新照片及新视频记录 mAP50–95、固定置信度下 IoU 0.50 匹配的宏平均 F1、召回、真值支持和空场误报。逐类表包含训练图片数、测试真值数及 TP／FP／FN。固定阈值的匹配在置信度过滤后重新计算。PyTorch 验证器时延单列，部署的 TensorRT P95 仍按同规格 T4 测量。
+
+image2 的 T4 隔离测试用现网权重和 A、B、C 短测权重读取同一份两图测试集。四组的真值支持一致，基线对新增类别记为漏检。指标数值复核还覆盖了空场误报、固定阈值重新匹配和同长度标签改动的摘要拦截。回执为 `image2:/mnt/data2/pbiomon-training-v1/preflight/evaluation-fixture-20261129-002729/result/receipt.json`。一次单独的数值复核触发了 image2 用户级 Ultralytics 设置的自动升级。此后的复核在独立目录运行，复验前后的用户设置文件摘要与时间戳一致。
+
 ### 对比结论
 
 三组的单机双卡接续和扩类入口已通过。正式实验等待不同来源新框的坐标单位、参考画面及方向，以及框和鉴定项的逐目标关联。收到证据后核对视频帧与标注、冻结混合集和独立测试，再执行现网基线和 A/B/C。每组记录数据版本、权重摘要、训练配置、吞吐、测试指标和实测延迟。
@@ -221,4 +229,11 @@ python3 tools/pbiomon_classes.py extend \
 ```bash
 "$training_python" tools/pbiomon_train.py --experiment "$experiment_json" --strategy A
 "$training_python" tools/pbiomon_train.py --experiment "$experiment_json" --strategy A --resume
+```
+
+评估配方 JSON 填写 `experiment_sha256` 和固定置信度 `confidence`。可填写 `nms_iou`、`max_det`、`batch`、`workers` 及 `half`。用 `--split val` 在封存验证集核对阈值。确认配方后，用同一文件评估独立测试集。评估在固定环境下使用一个可见 T4。
+
+```bash
+"$training_python" tools/pbiomon_evaluate.py --experiment "$experiment_json" \
+  --recipe "$evaluation_recipe" --split test --strategy all --out "$evaluation_output"
 ```
