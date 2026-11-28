@@ -184,6 +184,8 @@ image3 到 image2 的全量搬运已启动，范围为分组回执中的 580,838
 
 两台机器的任务目录均为 `/mnt/data2/pbiomon-training-v1/preflight/legacy-bulk-transfer-20261129`。image2 的 `status.json` 记录当前已验收数量、字节、每条链路已验收批次及传输用时。00:13 的实测中，万兆接口已传两批、约 1.96 GB，含逐图校验和落盘约 169 MB/s。管理口约 11.4 MB/s。image2 的万兆口还在尝试自动取地址，链路本地地址有间歇性缺失。
 
+00:41 修正发送端的链路切换。隔离复现中，挂起第一路连接会令旧实现的第二路超时。分接口独立接收后，第二路在第一路仍挂起时完成了文件传送和 SHA256 校验。已在 image3 切换发送进程（PID 2637704），image2 接收端沿用原进程和缓存续传。
+
 ### 2026-11-29 独立评估入口
 
 评估入口读取训练实验的封存数据回执，核对评估图片和标签的逐文件摘要，使用相同的样本、预处理与评估设置。现网基线使用 A 的初始化权重。A、B、C 使用各自已完成训练的 `best.pt` 及对应权重摘要。评估保留基线预测类别之外的新增小类真值，按漏检计入结果。 [评估工具](../tools/pbiomon_evaluate.py)
@@ -191,6 +193,12 @@ image3 到 image2 的全量搬运已启动，范围为分组回执中的 580,838
 输出按整体、旧库、新库、新照片及新视频记录 mAP50–95、固定置信度下 IoU 0.50 匹配的宏平均 F1、召回、真值支持和空场误报。逐类表包含训练图片数、测试真值数及 TP／FP／FN。固定阈值的匹配在置信度过滤后重新计算。PyTorch 验证器时延单列，部署的 TensorRT P95 仍按同规格 T4 测量。
 
 image2 的 T4 隔离测试用现网权重和 A、B、C 短测权重读取同一份两图测试集。四组的真值支持一致，基线对新增类别记为漏检。指标数值复核还覆盖了空场误报、固定阈值重新匹配和同长度标签改动的摘要拦截。回执为 `image2:/mnt/data2/pbiomon-training-v1/preflight/evaluation-fixture-20261129-002729/result/receipt.json`。一次单独的数值复核触发了 image2 用户级 Ultralytics 设置的自动升级。此后的复核在独立目录运行，复验前后的用户设置文件摘要与时间戳一致。
+
+### 2026-11-29 现网 TensorRT 基线小集
+
+从现网读取并核对引擎及对应权重摘要。在 image2 的独立目录使用现网的 TensorRT 10.6.0.post1 推理库、同规格 T4 以及固定的 Ultralytics 8.4.220 环境。以 640 输入、单图和现网照片端点置信度 0.256，测量 12 张旧回归图。两轮预热后执行 240 次，内存图片解码、预测与检测结果转 CPU 的端到端 P50 为 138.7 ms，P95 为 223.2 ms。期间旧图搬运仍在运行。重复测量的检测输出一致。 [引擎测量工具](../tools/pbiomon_benchmark_engine.py)
+
+同一批图片以 FP32 运行对应 `best.pt` 后，按相同小类且 IoU ≥ 0.95 匹配到 9 个框，另有 1 个只在 TensorRT 输出。匹配框最低 IoU 为 0.966，最大置信度绝对差为 0.0392。回执在 `image2:/mnt/data2/pbiomon-training-v1/preflight/trt-baseline-legacy12-run1/`，包含引擎、权重和输入指纹。正式时延与精度对比使用验收后封存的评估集。
 
 ### 对比结论
 
@@ -236,4 +244,12 @@ python3 tools/pbiomon_classes.py extend \
 ```bash
 "$training_python" tools/pbiomon_evaluate.py --experiment "$experiment_json" \
   --recipe "$evaluation_recipe" --split test --strategy all --out "$evaluation_output"
+```
+
+部署时延测量使用相同的图片 JSONL 和置信度，图片清单每条包含 `image` 和 `sha256`。先准备与引擎兼容的 TensorRT 运行库，再为每个引擎执行同一测量入口。
+
+```bash
+"$training_python" tools/pbiomon_benchmark_engine.py --engine "$engine" \
+  --engine-sha256 "$engine_sha256" --images "$benchmark_images" \
+  --confidence "$fixed_confidence" --out "$latency_output"
 ```

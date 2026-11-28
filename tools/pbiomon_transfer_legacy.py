@@ -3,16 +3,17 @@
 
 import argparse
 from collections import Counter, deque
+from contextlib import ExitStack
 from datetime import datetime
 import fcntl
 import ipaddress
 import json
 import os
 from pathlib import Path
-import selectors
 import socket
 import ssl
 import tarfile
+from threading import Thread
 import time
 
 from pbiomon_stage_legacy import candidates, image_path, media_key, pack, ready_image, receive
@@ -65,13 +66,28 @@ def send_batch(connection, ctx, entries, source, receipt_sha):
             pack(selection, source, stream)
 
 
+def serve_route(server, route, ctx, entries, root, receipt_sha):
+    peer = ipaddress.ip_address(route["target"])
+    while True:
+        connection, addr = server.accept()
+        with connection:
+            if ipaddress.ip_address(addr[0]) != peer:
+                continue
+            connection.settimeout(40)
+            try:
+                send_batch(connection, ctx, entries, root, receipt_sha)
+            except (OSError, ValueError, KeyError) as error:
+                print(f"{route['interface']}: {error}", flush=True)
+
+
 def serve(cfg):
     entries, root = snapshot(cfg), Path(cfg["legacy_root"]).resolve()
     state = Path(cfg["source_status"])
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cfg["server_cert"], cfg["server_key"])
     bindings = []
-    with selectors.DefaultSelector() as poller:
+    workers = []
+    with ExitStack() as sockets:
         for route in cfg["routes"]:
             addr = bind_address(route, "source", route["port"])
             server = socket.socket(socket.AF_INET6 if len(addr) == 4 else socket.AF_INET, socket.SOCK_STREAM)
@@ -83,23 +99,20 @@ def serve(cfg):
                 server.close()
                 print(f"{route['interface']}: {error}", flush=True)
                 continue
-            poller.register(server, selectors.EVENT_READ, route)
+            sockets.enter_context(server)
             bindings.append(route["interface"])
+            workers.append(Thread(
+                target=serve_route, name=route["interface"], daemon=True,
+                args=(server, route, ctx, entries, root, cfg["partition_receipt_sha256"]),
+            ))
         if not bindings:
             raise RuntimeError("No source interface is listening")
+        for worker in workers:
+            worker.start()
         write_json(state, {"status": "listening", "pid": os.getpid(), "routes": bindings, "images": len(entries)})
-        while True:
-            for key, _ in poller.select():
-                connection, addr = key.fileobj.accept()
-                with connection:
-                    route = key.data
-                    if ipaddress.ip_address(addr[0]) != ipaddress.ip_address(route["target"]):
-                        continue
-                    connection.settimeout(40)
-                    try:
-                        send_batch(connection, ctx, entries, root, cfg["partition_receipt_sha256"])
-                    except (OSError, ValueError, KeyError) as error:
-                        print(f"{route['interface']}: {error}", flush=True)
+        while all(worker.is_alive() for worker in workers):
+            workers[0].join(timeout=1)
+        raise RuntimeError("A source interface stopped listening")
 
 
 def fetch(route, ctx, wanted, entries, cache, receipt_sha):
