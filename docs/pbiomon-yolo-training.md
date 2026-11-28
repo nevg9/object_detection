@@ -29,7 +29,7 @@
 | 旧集去重、负样本和独立划分 | image3 正在逐图验收，扫描完成后自动生成内容去重和历史训练重叠清单 | `legacy-verification-20261128-222125/status.json` |
 | 新框坐标、属性关联、视频帧 | 已索引 563,010 条标注及版本，旧源同图和视频时间样本通过专项核对 | `review-inventory-20261128-222638/receipt.json` |
 | 类别注册及扩类 | 已核对现网 1,167 个类别和新库物种覆盖，按原 ID 扩展 A 检测头的短测通过 | `class-coverage-review-20261128-224048/receipt.json` |
-| 混合数据冻结与数据读取短测 | A/B/C 单机双卡扩类及检查点恢复通过，混合集待标签验收和独立划分 | `expanded-head-20261128-223841` |
+| 混合数据冻结与数据读取短测 | 照片、视频帧、旧库和三份划分的隔离导出及加载通过，A/B/C 单机双卡接续通过，真实混合集待证据 | `freeze-fixture-20261128-225734`、`expanded-head-20261128-223841` |
 | 现网基线与 A/B/C | 待执行 | 待写入 |
 
 ### 2026-11-28 初始盘点
@@ -127,6 +127,12 @@
 - 在 image0 建立完成媒体的版本复核索引，共 415,209 条照片记录和 147,801 条视频记录。18 条照片记录缺少 `attributes` 字段，来源为 11 月 2 日的旧采集任务。复核按标注摘要定位原始数组，保留坐标来源、字段状态和补标原因。索引位于 `image0:/mnt/data2/pbiomon-training-v1/preflight/review-inventory-20261128-222638/`。 [新库复核索引](../tools/pbiomon_review_inventory.py)
 - A/B/C 在 image2 共用 16 张旧训练图、8 张旧验证图，每组两张 T4、640 输入、全局 batch 8、FP16 AMP。隔离样本注册表追加 ID 1167，用于验证 1,168 类的检测头及完整接续链路。A 的 3 个检测层均核对旧类分类权重及偏置完整保留。三组第一轮保存后由新进程接续，恢复 AdamW 与 AMP scaler，均完成第二轮及验证。实验摘要为 `e1751be0e8b3db96e31f32437af124c4fa7b9e1760d1923bd704fc540dcf3a6b`，日志与检查点位于 `image2:/mnt/data2/pbiomon-training-v1/preflight/expanded-head-20261128-223841/`。该短测用于执行验收。 [训练和中断恢复入口](../tools/pbiomon_train.py)
 
+### 2026-11-28 混合数据集导出验证
+
+- image0 已生成 16 条真实归档复核样例，覆盖没有来源标记的照片框、AI 照片框、AI 视频框及虎和中华穿山甲。逐条核对了不可变汇总版本、物种标注摘要和原媒体 SHA256。样例标出源框下标、鉴定项下标和视频帧号，关联及坐标等待确认。复核文件在 `image0:/mnt/data2/pbiomon-training-v1/preflight/source-review-examples-20261128-225822/pending-examples.jsonl`。
+- 三江源目录内有 4,845 个文件名主干同时存在照片和 YOLO 标签，码表按相机配置，以物种和人、车等类别为主。与当前归档的有媒体照片按文件名主干比对，匹配数为 0。这批标签暂留在原目录。
+- image2 的隔离测试成功导出并加载 4 张训练图、1 张验证图和 2 张测试图。包含旧库照片、带 EXIF 方向的照片和可变帧率视频的两个定位帧。检查覆盖了同内容去重、错误鉴定项、缺少关联证据、视频时间偏差、历史训练同名候选和跨划分的同一拍摄事件。通过隔离验证的执行入口可接收逐框复核结果。 [混合数据集导出入口](../tools/pbiomon_freeze_dataset.py)
+
 ### 对比结论
 
 三组的单机双卡接续和扩类入口已通过。正式实验等待不同来源新框的坐标单位、参考画面及方向，以及框和鉴定项的逐目标关联。收到证据后核对视频帧与标注、冻结混合集和独立测试，再执行现网基线和 A/B/C。每组记录数据版本、权重摘要、训练配置、吞吐、测试指标和实测延迟。
@@ -138,7 +144,19 @@
 ```bash
 python3 tools/pbiomon_classes.py extend \
   --legacy-registry "$previous_registry" --approved "$approved_classes" \
-  --out "$frozen_dataset/classes.json"
+  --out "$candidate_classes"
+```
+
+在可读取两份源媒体的训练机器上导出，保留快照标注、逐类图片及框数、排除记录、逐样本摘要和旧场景／新场景测试清单。新库复核输入为 JSONL，每行对应一个资源，包含 `type`、`resource_id`、`media_sha256`、`bundle_sha256`、`split`、`group_id` 和 `frames`。统一拍摄事件或近重复组使用同一个 `group_id`，验证和测试记录提供对历史训练暴露的核对证据。与历史训练同名的照片另附内容复核证据。
+
+每个帧记录包含实际显示宽高 `display_size`、复核依据 `review_evidence` 和完整覆盖标记 `complete`。照片的 `frame_id` 和 `ts_ms` 均为 `null`。视频使用原始帧序与时间戳。每个框记录提供 `species_id`、源 `box_index`、已确认的 `attribute_index`、标准化 `species/gender/age`、以实际显示像素表示的 `xyxy`、`coordinate_evidence` 和 `association_evidence`。独立补标的框或属性可省去对应的下标，标为 `null` 并附依据。旧库回归批准清单的每行包含 `sha256` 和 `exposure_evidence`，可通过 `split` 指定验证或测试，默认测试。
+
+```bash
+"$training_python" tools/pbiomon_freeze_dataset.py \
+  --archive "$archive_root" --accepted "$accepted_archive_reviews" \
+  --legacy-root "$legacy_root" --legacy-partitions "$partition_receipt_dir" \
+  --legacy-test "$accepted_legacy_eval" --classes "$candidate_classes" \
+  --out "$frozen_dataset"
 ```
 
 同一份实验 JSON 记录 `purpose=comparison`、`runs`、带摘要的 `dataset.receipt`、A/B/C 的初始权重路径及摘要、`runtime` 和 `training` 参数。冻结回执记录图片来源、训练／验证／测试样本量，以及 `data.yaml`、`classes.json`、`manifest.jsonl.gz` 和三份划分列表的摘要。正式使用时设置当前可用的 CUDA 设备和已验收的 Ultralytics 路径，A、B、C 分别传对应的 `--strategy`。中断后沿用相同实验文件和组别，加 `--resume`。
