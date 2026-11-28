@@ -27,7 +27,7 @@
 | --- | --- | --- |
 | 数据盘点 | 已完成初次核对，开始复核可用性 | 下方统计 |
 | 旧集去重、负样本和独立划分 | image3 正在逐图验收，扫描完成后自动生成内容去重和历史训练重叠清单 | `legacy-verification-20261128-222125/status.json` |
-| 新框坐标、属性关联、视频帧 | 已索引 563,010 条标注及版本，旧源同图和视频时间样本通过专项核对 | `review-inventory-20261128-222638/receipt.json` |
+| 新框坐标、属性关联、视频帧 | 旧源同图标尺已核对，AI 像素框和旋转样例已检查。其他参考画面及逐框属性待确认 | `review-inventory-20261128-222638/receipt.json`、`preflight/evidence/box-alignment-20261128/` |
 | 类别注册及扩类 | 已核对现网 1,167 个类别和新库物种覆盖，按原 ID 扩展 A 检测头的短测通过 | `class-coverage-review-20261128-224048/receipt.json` |
 | 混合数据冻结与数据读取短测 | 照片、视频帧、旧库和三份划分的隔离导出及加载通过，A/B/C 单机双卡接续通过，真实混合集待证据 | `freeze-fixture-20261128-225734`、`expanded-head-20261128-223841` |
 | 现网基线与 A/B/C | 待执行 | 待写入 |
@@ -133,6 +133,17 @@
 - 三江源目录内有 4,845 个文件名主干同时存在照片和 YOLO 标签，码表按相机配置，以物种和人、车等类别为主。与当前归档的有媒体照片按文件名主干比对，匹配数为 0。这批标签暂留在原目录。
 - image2 的隔离测试成功导出并加载 4 张训练图、1 张验证图和 2 张测试图。包含旧库照片、带 EXIF 方向的照片和可变帧率视频的两个定位帧。检查覆盖了同内容去重、错误鉴定项、缺少关联证据、视频时间偏差、历史训练同名候选和跨划分的同一拍摄事件。通过隔离验证的执行入口可接收逐框复核结果。 [混合数据集导出入口](../tools/pbiomon_freeze_dataset.py)
 
+### 2026-11-28 按旧库核对框存储
+
+旧原始框存 `(left, top, right, bottom)`，先按 65,536 的标尺换到原图，再写归一化 YOLO 标签。新接口存 `(left, top, width, height)`，先还原右下角 `(left + width, top + height)`。对从原始 API 页抽核的 16 个资源，18 个照片框和 606 个视频框在归档后的值、顺序和属性数组均与源页一致。 [旧坐标转换](../process_data/transform_position_to_yolo_position.py#L48-L67)
+
+- 通过文件名候选与统一方向的缩略图确认 536 对同图。其中 505 对直立照片具备可比的同物种单框和旧 YOLO 标签。新框还原后 505 对的四角原值逐项相同。按旧标尺与实际旧 TXT 对照，505 对的 IoU 均 ≥ 0.999，按原图像素解释达到同阈值的有 0 对。另有 24 对新图的 EXIF 值为 0，原框和对应旧标签也相符。余下 7 对缺少唯一同物种旧框。
+- 全部归档照片中有 413,000 张 EXIF 1、1,307 张 EXIF 0 和 1 张 EXIF 8。EXIF 8 的猕猴样例原图为 3,000×4,000，展示图为 4,000×3,000。按 65,536 标尺转换到原图后，框随图旋转才能覆盖目标。
+- 抽测的 3 个 AI 照片框和 3 个视频的 9 个非首帧框按解码画面像素落在可见目标上，视频帧时间与接口偏差最大为 0.335 ms。另有未标来源的小数坐标样例，两种画法均偏离画面中清晰可见的野猪，参考画面需进一步确认。来源空值不能作为旧标尺的唯一依据。
+- 505 对框对应的旧标签中，450 对能找到一个标准化性别年龄与旧类一致的新鉴定项，55 对没有显式一致的项。框对齐后，逐目标属性仍需单独核验。原值、抽样脚本和叠加图位于 `image0:/mnt/data2/pbiomon-training-v1/preflight/evidence/box-alignment-20261128/`。
+
+历史验证的 60,719 张通过标签文本筛查的阳性图中，按文件名可核对出 59,258 张与旧训练同相机同日，1,452 张缺少可核对的日期，按此口径剩 9 张候选图和 7 个相机日期组，后续还需经过内容核验。这一规模不足以支撑完整的旧类回归结论。记录位于 `image3:/mnt/data2/pbiomon-training-v1/preflight/work/legacy-regression-preview-q5_1i6a_.json`。
+
 ### 对比结论
 
 三组的单机双卡接续和扩类入口已通过。正式实验等待不同来源新框的坐标单位、参考画面及方向，以及框和鉴定项的逐目标关联。收到证据后核对视频帧与标注、冻结混合集和独立测试，再执行现网基线和 A/B/C。每组记录数据版本、权重摘要、训练配置、吞吐、测试指标和实测延迟。
@@ -149,7 +160,7 @@ python3 tools/pbiomon_classes.py extend \
 
 在可读取两份源媒体的训练机器上导出，保留快照标注、逐类图片及框数、排除记录、逐样本摘要和旧场景／新场景测试清单。新库复核输入为 JSONL，每行对应一个资源，包含 `type`、`resource_id`、`media_sha256`、`bundle_sha256`、`split`、`group_id` 和 `frames`。统一拍摄事件或近重复组使用同一个 `group_id`，验证和测试记录提供对历史训练暴露的核对证据。与历史训练同名的照片另附内容复核证据。
 
-每个帧记录包含实际显示宽高 `display_size`、复核依据 `review_evidence` 和完整覆盖标记 `complete`。照片的 `frame_id` 和 `ts_ms` 均为 `null`。视频使用原始帧序与时间戳。每个框记录提供 `species_id`、源 `box_index`、已确认的 `attribute_index`、标准化 `species/gender/age`、以实际显示像素表示的 `xyxy`、`coordinate_evidence` 和 `association_evidence`。独立补标的框或属性可省去对应的下标，标为 `null` 并附依据。旧库回归批准清单的每行包含 `sha256` 和 `exposure_evidence`，可通过 `split` 指定验证或测试，默认测试。
+每个帧记录包含实际显示宽高 `display_size`、复核依据 `review_evidence` 和完整覆盖标记 `complete`。照片的 `frame_id` 和 `ts_ms` 均为 `null`。视频使用原始帧序与时间戳。每个框记录提供 `species_id`、源 `box_index`、已确认的 `attribute_index`、标准化 `species/gender/age`、以实际显示像素表示的 `xyxy`、`coordinate_evidence` 和 `association_evidence`。独立补标的框或属性将对应下标填为 `null` 并附依据。旧库回归批准清单的每行包含 `sha256` 和 `exposure_evidence`，可通过 `split` 指定验证或测试，默认测试。
 
 ```bash
 "$training_python" tools/pbiomon_freeze_dataset.py \
